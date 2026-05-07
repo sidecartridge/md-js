@@ -89,7 +89,7 @@ int mdjs_reset(void);
 /**
  * @brief Submit an async JS function call and return immediately.
  * The RP2040 ACKs before Core 1 has finished executing. Poll for completion
- * with mdjs_result_ready() or mdjs_poll().
+ * with mdjs_status() or mdjs_poll().
  * @param func      NUL-terminated function name (max 63 characters).
  * @param args_json NUL-terminated JSON array string, e.g. "[5,7]".
  * @return 0 on success (call submitted), MDJS_STATUS_BUSY if a prior async
@@ -112,13 +112,13 @@ int mdjs_result(char *result, int result_size);
  * Zero-overhead — no bus transaction, just a memory read.
  * @return One of MDJS_STATUS_IDLE / BUSY / DONE / ERROR.
  */
-unsigned char mdjs_result_ready(void);
+unsigned char mdjs_status(void);
 
 /**
  * @brief Send CMD_JS_POLL and return the current async status.
  * Use this when you want the RP2040 to write a JSON status object to
  * MDJS_RESULT_ADDR (e.g. {"status":2}) in addition to reading the status.
- * For a plain non-blocking check, prefer mdjs_result_ready().
+ * For a plain non-blocking check, prefer mdjs_status().
  * @return One of MDJS_STATUS_IDLE / BUSY / DONE / ERROR, or non-zero on error.
  */
 int mdjs_poll(void);

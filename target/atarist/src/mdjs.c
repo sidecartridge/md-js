@@ -167,7 +167,7 @@ int mdjs_reset(void)
 int mdjs_call_async(const char *func, const char *args_json)
 {
     /* Bail immediately if a previous async call is still running */
-    if (mdjs_result_ready() == MDJS_STATUS_BUSY)
+    if (mdjs_status() == MDJS_STATUS_BUSY)
         return MDJS_STATUS_BUSY;
 
     /* Build payload identically to mdjs_call() */
@@ -197,7 +197,7 @@ int mdjs_result(char *result, int result_size)
     return 0;
 }
 
-unsigned char mdjs_result_ready(void)
+unsigned char mdjs_status(void)
 {
     return *MDJS_STATUS_ADDR;
 }
@@ -206,6 +206,6 @@ int mdjs_poll(void)
 {
     int err = call_send_sync(CMD_JS_POLL, 4, 0L, 0L);
     if (err != 0) return err;
-    return (int)mdjs_result_ready();
+    return (int)mdjs_status();
 }
 

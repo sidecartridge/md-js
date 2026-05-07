@@ -35,26 +35,6 @@ The result buffer is mapped into the ST's ROM4 address space at `$FAF100` and is
 - Atari ST, STE, MegaST, or MegaSTE
 - Raspberry Pi Debug Probe or Picoprobe for flashing/debugging (optional but recommended for development)
 
-## Repository structure
-
-```
-rp/src/           RP2040 firmware (C, Pico SDK + JerryScript)
-  js_worker.c     Core 1 JerryScript worker + Core 0 dispatcher
-  jerry_port.c    Minimal JerryScript port layer for RP2040
-  emul.c          ROM emulator + firmware entry point
-
-target/atarist/   Atari ST firmware and demo app
-  src/main.s      ROM cartridge header and boot stub (68000 assembly)
-  src/mdjs.h      ST-side C API header
-  src/mdjs.c      ST-side client library (ping / upload / call / call_async / poll / reset)
-  src/demo_gem.c  GEM demo app — uploads add(), calls it, shows result
-
-lib/jerryscript/  JerryScript v3.0.0 (git submodule)
-pico-sdk/         Raspberry Pi Pico SDK v2.2.0 (git submodule)
-pico-extras/      Pico Extras sdk-2.2.0 (git submodule)
-fatfs-sdk/        FatFS SD/SDIO driver (git submodule)
-```
-
 ## ST-side API
 
 Include `mdjs.h` and link against `mdjs.c` and `sidecart_stubs.S` in your ST project.
@@ -91,18 +71,18 @@ int err = mdjs_call_async("heavyCalc", "[1000]");
 if (err != 0) { /* busy or protocol error */ }
 
 /* Do other work while JS runs on Core 1 */
-while (mdjs_result_ready() == MDJS_STATUS_BUSY) {
+while (mdjs_status() == MDJS_STATUS_BUSY) {
     do_other_work();
 }
 
-if (mdjs_result_ready() == MDJS_STATUS_DONE) {
+if (mdjs_status() == MDJS_STATUS_DONE) {
     char result[256];
     mdjs_result(result, sizeof(result));
     /* result now contains the JSON return value */
 }
 ```
 
-`mdjs_result_ready()` is a zero-overhead single byte read from `MDJS_STATUS_ADDR` (`$FAF008`) — no bus transaction. Only one async call can be in flight at a time; submitting a second returns `MDJS_STATUS_BUSY` immediately.
+`mdjs_status()` is a zero-overhead single byte read from `MDJS_STATUS_ADDR` (`$FAF008`) — no bus transaction. Only one async call can be in flight at a time; submitting a second returns `MDJS_STATUS_BUSY` immediately.
 
 ## API limits
 
@@ -114,6 +94,26 @@ if (mdjs_result_ready() == MDJS_STATUS_DONE) {
 | JerryScript heap       | 48 KB                                |
 | Result buffer (ST)     | `$FAF100` (ROM4 + 0xF100)            |
 | Async status byte (ST) | `$FAF008` (ROM4 + 0xF008)            |
+
+## Repository structure
+
+```
+rp/src/           RP2040 firmware (C, Pico SDK + JerryScript)
+  js_worker.c     Core 1 JerryScript worker + Core 0 dispatcher
+  jerry_port.c    Minimal JerryScript port layer for RP2040
+  emul.c          ROM emulator + firmware entry point
+
+target/atarist/   Atari ST firmware and demo app
+  src/main.s      ROM cartridge header and boot stub (68000 assembly)
+  src/mdjs.h      ST-side C API header
+  src/mdjs.c      ST-side client library (ping / upload / call / call_async / poll / reset)
+  src/demo_gem.c  GEM demo app — uploads add(), calls it, shows result
+
+lib/jerryscript/  JerryScript v3.0.0 (git submodule)
+pico-sdk/         Raspberry Pi Pico SDK v2.2.0 (git submodule)
+pico-extras/      Pico Extras sdk-2.2.0 (git submodule)
+fatfs-sdk/        FatFS SD/SDIO driver (git submodule)
+```
 
 ## Build prerequisites
 
