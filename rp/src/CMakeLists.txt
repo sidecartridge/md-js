@@ -144,6 +144,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         mdjs_protocol.c
         reset.c
         romemul.c
+        select.c
         tprotocol.c
         settings/settings.c)
 

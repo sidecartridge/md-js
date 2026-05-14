@@ -15,6 +15,7 @@
 #include "hardware/vreg.h"
 #include "pico/stdlib.h"
 #include "reset.h"
+#include "select.h"
 
 // This is the main.c file for the app or microfirmware. It is the entry point
 // for the application. It is the first file that is executed when the
@@ -95,6 +96,15 @@ int main() {
           (unsigned int)&__rom_in_ram_start__, romInRamLength);
 
 #endif
+
+  // If the SELECT button is held at boot, exit to Booster immediately so the
+  // user can swap microfirmware without having to wait for the app to finish
+  // initialising. Debounced check mirrors the pattern used in md-rom-emulator.
+  select_configure();
+  if (select_detectPush()) {
+    DPRINTF("SELECT held at boot — jumping to Booster\n");
+    reset_jump_to_booster();
+  }
 
   // Load the global configuration parameters
   int err = gconfig_init(CURRENT_APP_UUID_KEY);
