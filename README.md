@@ -86,14 +86,15 @@ if (mdjs_status() == MDJS_STATUS_DONE) {
 
 ## API limits
 
-| Parameter              | Limit / address                      |
-| ---------------------- | ------------------------------------ |
-| JS source per upload   | Up to ~16 KB (8 chunks × 2102 bytes) |
-| Function name          | 63 characters                        |
-| Result / args JSON     | 2048 bytes                           |
-| JerryScript heap       | 48 KB                                |
-| Result buffer (ST)     | `$FAF100` (ROM4 + 0xF100)            |
-| Async status byte (ST) | `$FAF008` (ROM4 + 0xF008)            |
+| Parameter              | Limit / address                              |
+| ---------------------- | -------------------------------------------- |
+| JS source per upload   | Up to ~16 KB (8 chunks × 2096 bytes)         |
+| Function name          | 63 characters                                |
+| Result JSON            | 2048 bytes                                   |
+| Args JSON              | 2031 bytes (max, with 63-char function name) |
+| JerryScript heap       | 48 KB                                        |
+| Result buffer (ST)     | `$FAF100` (ROM4 + 0xF100)                    |
+| Async status byte (ST) | `$FAF008` (ROM4 + 0xF008)                    |
 
 ## Repository structure
 

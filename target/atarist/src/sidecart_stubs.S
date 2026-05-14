@@ -152,6 +152,20 @@ send_sync_command_to_sidecart:
 .Ltoken_found:
     rts
 
+/* ── C ABI wrappers for mdjs.c (avoid fragile inline asm constraints) ────── */
+/* int mdjs_send_sync_command(int cmd, int payload_size, long d3, long d4) */
+    .globl _mdjs_send_sync_command
+_mdjs_send_sync_command:
+    /* Preserve callee-saved registers expected by the C ABI. */
+    movem.l d2-d7/a2-a6,-(sp)
+    move.w  48(sp),d0
+    move.w  52(sp),d1
+    move.l  56(sp),d3
+    move.l  60(sp),d4
+    jsr     send_sync_command_to_sidecart
+    movem.l (sp)+,d2-d7/a2-a6
+    rts
+
 
 /* ── send_sync_write_command_to_sidecart ───────────────────────────────────── */
     .globl send_sync_write_command_to_sidecart
@@ -313,4 +327,24 @@ send_sync_write_command_to_sidecart:
     bne.s   .Lwait_write_token
     subq.l  #1,d0
 .Lwrite_token_found:
+    rts
+
+/* int mdjs_send_sync_write_command(int cmd, const char *buf, int byte_count,
+ *                                  int chunk_idx, int total_chunks,
+ *                                  int chunk_size) */
+    .globl _mdjs_send_sync_write_command
+_mdjs_send_sync_write_command:
+    /* Preserve callee-saved registers expected by the C ABI. */
+    movem.l d2-d7/a2-a6,-(sp)
+    move.w  48(sp),d0
+    move.l  52(sp),a4
+    move.w  56(sp),d6
+    moveq   #0,d3
+    move.w  60(sp),d3
+    moveq   #0,d4
+    move.w  64(sp),d4
+    moveq   #0,d5
+    move.w  68(sp),d5
+    jsr     send_sync_write_command_to_sidecart
+    movem.l (sp)+,d2-d7/a2-a6
     rts

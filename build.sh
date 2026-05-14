@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Get the absolute path of the current script
 SCRIPT_DIR=$(dirname "$(realpath "$0")") 
 

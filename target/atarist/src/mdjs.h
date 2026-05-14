@@ -45,8 +45,8 @@
 #define JS_RESULT_SIZE 2048
 
 /* ── Maximum JS bytes per upload chunk ──────────────────────────────────── */
-/* MAX_PROTOCOL_PAYLOAD_SIZE (2112) minus 10 bytes of upload header.         */
-#define JS_UPLOAD_CHUNK_MAX   2102
+/* MAX_PROTOCOL_PAYLOAD_SIZE (2112) minus 16-byte send_sync_write header.    */
+#define JS_UPLOAD_CHUNK_MAX   2096
 
 /* ── Maximum function name length (including NUL terminator) ────────────── */
 #define JS_CALL_FUNC_NAME_MAX 64
@@ -64,15 +64,16 @@ int mdjs_ping(void);
  * @brief Upload JavaScript source code to the worker.
  * The source is split into chunks automatically if needed.
  * The uploaded code is evaluated immediately after the last chunk is received.
- * @param js_source NUL-terminated JavaScript source string.
+ * @param js_source NUL-terminated JavaScript source string (non-NULL).
  * @return 0 on success, non-zero on error.
  */
 int mdjs_upload(const char *js_source);
 
 /**
  * @brief Call a named JavaScript function with JSON arguments.
- * @param func       NUL-terminated function name (max 63 characters).
+ * @param func       NUL-terminated function name (max 63 characters, non-NULL).
  * @param args_json  NUL-terminated JSON array string, e.g. "[5,7]".
+ *                   Effective max is 2031 bytes when func is 63 chars.
  * @param result     Caller-supplied buffer for the JSON result string.
  * @param result_size Size of the result buffer in bytes.
  * @return 0 on success, non-zero on error.
@@ -90,8 +91,9 @@ int mdjs_reset(void);
  * @brief Submit an async JS function call and return immediately.
  * The RP2040 ACKs before Core 1 has finished executing. Poll for completion
  * with mdjs_status() or mdjs_poll().
- * @param func      NUL-terminated function name (max 63 characters).
- * @param args_json NUL-terminated JSON array string, e.g. "[5,7]".
+ * @param func      NUL-terminated function name (max 63 characters, non-NULL).
+ * @param args_json NUL-terminated JSON array string, e.g. "[5,7]" (non-NULL).
+ *                  Effective max is 2031 bytes when func is 63 chars.
  * @return 0 on success (call submitted), MDJS_STATUS_BUSY if a prior async
  *         call is still in flight, non-zero on protocol error.
  */
@@ -124,4 +126,3 @@ unsigned char mdjs_status(void);
 int mdjs_poll(void);
 
 #endif /* MDJS_H */
-

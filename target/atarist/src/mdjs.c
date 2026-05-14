@@ -5,72 +5,67 @@
  * Wraps the SidecarTridge low-level command protocol (send_sync /
  * send_sync_write) for use from C code.
  *
- * The underlying assembly routines (send_sync_command_to_sidecart,
- * send_sync_write_command_to_sidecart) use a register-based ABI:
- *   D0.W  = command code
- *   D1.W  = payload size in bytes
- *   D3–D6 = payload words (for small payloads)
- *   A4    = buffer pointer (for write commands)
- *   D6.W  = write byte count (for write commands)
- * Return value: D0.W = 0 on success, non-zero on timeout/error.
- *
- * GCC m68k passes function arguments on the stack and returns in D0, so
- * we use inline __asm__ blocks to marshal registers explicitly.
+ * Register marshalling is implemented in dedicated assembly wrappers
+ * (sidecart_stubs.S) to keep C code ABI-safe and avoid inline asm
+ * constraint pitfalls on m68k.
  */
 
 #include "mdjs.h"
 
 #include <string.h>
 
-/* Entry points provided by sidecart_stubs.S (GAS-assembled alongside this file) */
-extern int send_sync_command_to_sidecart(void);
-extern int send_sync_write_command_to_sidecart(void);
+/* C ABI entry points provided by sidecart_stubs.S */
+extern int mdjs_send_sync_command(int cmd, int payload_size, long d3, long d4);
+extern int mdjs_send_sync_write_command(int cmd, const char *buf, int byte_count,
+                                        int chunk_idx, int total_chunks,
+                                        int chunk_size);
 
 /* ── Helper: call send_sync for a small (register-payload) command ────────── */
-/* Sets D0=cmd, D1=payload_size, D3=d3, D4=d4. Returns D0 (0=ok). */
 static int call_send_sync(unsigned short cmd, unsigned short payload_size,
                            long d3, long d4)
 {
-    register int result __asm__("d0");
-    register unsigned short r_cmd  __asm__("d0") = cmd;
-    register unsigned short r_size __asm__("d1") = payload_size;
-    register long r_d3             __asm__("d3") = d3;
-    register long r_d4             __asm__("d4") = d4;
-
-    __asm__ volatile (
-        "jsr send_sync_command_to_sidecart"
-        : "=d" (result)
-        : "d" (r_cmd), "d" (r_size), "d" (r_d3), "d" (r_d4)
-        : "d2", "d5", "d6", "d7", "a0", "a1", "a2", "a3", "cc", "memory"
-    );
-    return result;
+    return mdjs_send_sync_command((int)cmd, (int)payload_size, d3, d4);
 }
 
 /* ── Helper: call send_sync_write for a buffer payload ───────────────────── */
-/* Sets D0=cmd, A4=buf, D6.W=byte_count, D3=chunk_idx, D4=total_chunks,     */
-/* D5=chunk_size. Returns D0 (0=ok).                                         */
 static int call_send_sync_write(unsigned short cmd,
                                  const char *buf, unsigned short byte_count,
                                  unsigned short chunk_idx,
                                  unsigned short total_chunks,
                                  unsigned short chunk_size)
 {
-    register int result      __asm__("d0");
-    register unsigned short r_cmd   __asm__("d0") = cmd;
-    register unsigned short r_count __asm__("d6") = byte_count;
-    register long r_d3              __asm__("d3") = (long)chunk_idx;
-    register long r_d4              __asm__("d4") = (long)total_chunks;
-    register long r_d5              __asm__("d5") = (long)chunk_size;
-    register const char *r_a4      __asm__("a4") = buf;
+    return mdjs_send_sync_write_command((int)cmd, buf, (int)byte_count,
+                                        (int)chunk_idx, (int)total_chunks,
+                                        (int)chunk_size);
+}
 
-    __asm__ volatile (
-        "jsr send_sync_write_command_to_sidecart"
-        : "=d" (result)
-        : "d" (r_cmd), "d" (r_count), "d" (r_d3), "d" (r_d4),
-          "d" (r_d5), "a" (r_a4)
-        : "d1", "d2", "d7", "a0", "a1", "a2", "a3", "cc", "memory"
-    );
-    return result;
+/* Build CALL payload as func_name\0args_json\0 and return byte length. */
+static unsigned short build_call_payload(const char *func, const char *args_json,
+                                         char *payload)
+{
+    int fn_len  = (int)strlen(func);
+    int arg_len = (int)strlen(args_json);
+    int max_args_len;
+
+    if (fn_len >= JS_CALL_FUNC_NAME_MAX) {
+        fn_len = JS_CALL_FUNC_NAME_MAX - 1;
+    }
+
+    /* Keep the write body within JS_UPLOAD_CHUNK_MAX (send_sync_write adds 16 bytes). */
+    max_args_len = JS_UPLOAD_CHUNK_MAX - (fn_len + 2);
+    if (max_args_len < 0) {
+        max_args_len = 0;
+    }
+    if (arg_len > max_args_len) {
+        arg_len = max_args_len;
+    }
+
+    memcpy(payload, func, (unsigned int)fn_len);
+    payload[fn_len] = '\0';
+    memcpy(payload + fn_len + 1, args_json, (unsigned int)arg_len);
+    payload[fn_len + 1 + arg_len] = '\0';
+
+    return (unsigned short)(fn_len + 1 + arg_len + 1);
 }
 
 /* ── Read result from MDJS_RESULT_ADDR into a C buffer ─────────────────────── */
@@ -105,6 +100,10 @@ int mdjs_ping(void)
 
 int mdjs_upload(const char *js_source)
 {
+    if (!js_source) {
+        return 1;
+    }
+
     int total        = (int)strlen(js_source);
     int offset       = 0;
     int chunk_idx    = 0;
@@ -135,21 +134,12 @@ int mdjs_upload(const char *js_source)
 int mdjs_call(const char *func, const char *args_json,
               char *result, int result_size)
 {
-    /* Payload buffer: func_name\0args_json\0
-     * func capped at JS_CALL_FUNC_NAME_MAX-1 (63); args fill the rest. */
-    char payload[JS_CALL_FUNC_NAME_MAX + JS_RESULT_SIZE];
-    int fn_len  = (int)strlen(func);
-    int arg_len = (int)strlen(args_json);
+    if (!func || !args_json) {
+        return 1;
+    }
 
-    if (fn_len  >= JS_CALL_FUNC_NAME_MAX)  fn_len  = JS_CALL_FUNC_NAME_MAX - 1;
-    if (arg_len >= JS_RESULT_SIZE)         arg_len = JS_RESULT_SIZE - 1;
-
-    memcpy(payload, func, (unsigned int)fn_len);
-    payload[fn_len] = '\0';
-    memcpy(payload + fn_len + 1, args_json, (unsigned int)arg_len);
-    payload[fn_len + 1 + arg_len] = '\0';
-
-    unsigned short body_len = (unsigned short)(fn_len + 1 + arg_len + 1);
+    char payload[JS_UPLOAD_CHUNK_MAX];
+    unsigned short body_len = build_call_payload(func, args_json, payload);
     int err = call_send_sync_write(CMD_JS_CALL, payload, body_len, 0, 1, body_len);
     if (err != 0) return err;
 
@@ -166,24 +156,16 @@ int mdjs_reset(void)
 
 int mdjs_call_async(const char *func, const char *args_json)
 {
+    if (!func || !args_json) {
+        return 1;
+    }
+
     /* Bail immediately if a previous async call is still running */
     if (mdjs_status() == MDJS_STATUS_BUSY)
         return MDJS_STATUS_BUSY;
 
-    /* Build payload identically to mdjs_call() */
-    char payload[JS_CALL_FUNC_NAME_MAX + JS_RESULT_SIZE];
-    int fn_len  = (int)strlen(func);
-    int arg_len = (int)strlen(args_json);
-
-    if (fn_len  >= JS_CALL_FUNC_NAME_MAX)  fn_len  = JS_CALL_FUNC_NAME_MAX - 1;
-    if (arg_len >= JS_RESULT_SIZE)         arg_len = JS_RESULT_SIZE - 1;
-
-    memcpy(payload, func, (unsigned int)fn_len);
-    payload[fn_len] = '\0';
-    memcpy(payload + fn_len + 1, args_json, (unsigned int)arg_len);
-    payload[fn_len + 1 + arg_len] = '\0';
-
-    unsigned short body_len = (unsigned short)(fn_len + 1 + arg_len + 1);
+    char payload[JS_UPLOAD_CHUNK_MAX];
+    unsigned short body_len = build_call_payload(func, args_json, payload);
     return call_send_sync_write(CMD_JS_CALL_ASYNC, payload, body_len,
                                 0, 1, body_len);
 }
@@ -208,4 +190,3 @@ int mdjs_poll(void)
     if (err != 0) return err;
     return (int)mdjs_status();
 }
-

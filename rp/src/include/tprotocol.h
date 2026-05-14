@@ -146,6 +146,16 @@ static inline __attribute__((always_inline)) void __not_in_flash_func(
 // --------------------------------------
 static inline __attribute__((always_inline)) void __not_in_flash_func(
     read_payload_size)(uint16_t data) {
+  if (data > MAX_PROTOCOL_PAYLOAD_SIZE) {
+    /* Reject oversized payloads to avoid writing past payload[]. */
+    tprotocol_last_header_found = 0;
+    tprotocol_nextTPstep = HEADER_DETECTION;
+    tprotocol_transmission.bytes_read = 0;
+    tprotocol_transmission.payload_size = 0;
+    tprotocol_transmission.final_checksum = 0;
+    return;
+  }
+
   if (data > 0) {
     tprotocol_transmission.payload_size = data;
     tprotocol_nextTPstep = PAYLOAD_READ_START;
@@ -165,6 +175,11 @@ static inline __attribute__((always_inline)) void __not_in_flash_func(
 // --------------------------------------
 static inline __attribute__((always_inline)) void __not_in_flash_func(
     read_payload)(uint16_t data) {
+  if (tprotocol_transmission.bytes_read + 2 > MAX_PROTOCOL_PAYLOAD_SIZE) {
+    tprotocol_nextTPstep = PAYLOAD_READ_END;
+    return;
+  }
+
   // Store the 16-bit chunk into the payload array
   store_payload_16_asm(
       data, &tprotocol_transmission.payload[tprotocol_transmission.bytes_read]);
