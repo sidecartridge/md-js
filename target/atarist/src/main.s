@@ -114,6 +114,15 @@ pre_auto:
 start_rom_code:
 ; Detect MD/JS worker (ping the RP2040 with CMD_JS_PING)
 ; D7 = 1 if worker is available, 0 otherwise (used by boot_gem path)
+; Wait ~1 second (50 VBL ticks on PAL / 60 on NTSC) so the RP2040 has time
+; to bring up JerryScript before we ping it, otherwise the first ping
+; usually races the worker and reports "not detected".
+	move.w #50, d6
+.js_detect_delay:
+	move.w #37, -(sp)			; XBIOS Vsync — wait for next vertical blank
+	trap #14
+	addq.l #2, sp
+	dbf d6, .js_detect_delay
 	send_sync CMD_JS_PING, 4	; payload = random token only (4 bytes)
 	tst.w d0					; D0 = 0 on success, non-zero on timeout/error
 	beq.s .js_found
