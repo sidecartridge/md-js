@@ -107,6 +107,8 @@ static volatile uint8_t s_core1_phase = 0;
 #define C1_PHASE_UPLOAD_OK        12
 #define C1_PHASE_CALL_FUNC_FOUND  13
 #define C1_PHASE_CALL_FUNC_MISS   14
+#define C1_PHASE_CALL_RESULT_OK   15
+#define C1_PHASE_CALL_RESULT_ERR  16
 
 static volatile uint8_t s_core1_diag = 0;
 
@@ -338,6 +340,29 @@ static void core1_handle_call(void) {
   }
 
 write_result:
+  /* Snapshot the result for Core 0 to print. */
+  {
+    int n = snprintf(s_core1_diag_msg, sizeof(s_core1_diag_msg),
+                     "call result is_err=%d len=%lu '",
+                     (int)result_is_error,
+                     (unsigned long)strnlen(s_core1_result_json,
+                                            sizeof(s_core1_result_json)));
+    size_t srclen = strnlen(s_core1_result_json, sizeof(s_core1_result_json));
+    size_t snap = srclen < 60u ? srclen : 60u;
+    for (size_t i = 0; (i < snap) && (n < (int)sizeof(s_core1_diag_msg) - 2);
+         i++) {
+      char c = s_core1_result_json[i];
+      s_core1_diag_msg[n++] = (c >= 0x20 && c <= 0x7E) ? c : '.';
+    }
+    if (n < (int)sizeof(s_core1_diag_msg) - 1) {
+      s_core1_diag_msg[n++] = '\'';
+    }
+    s_core1_diag_msg[n] = '\0';
+    s_core1_diag_seq++;
+    s_core1_diag = result_is_error ? C1_PHASE_CALL_RESULT_ERR
+                                    : C1_PHASE_CALL_RESULT_OK;
+  }
+
   save = spin_lock_blocking(s_spin_lock);
   memcpy(s_msg.result_json, s_core1_result_json, JS_RESULT_MAX_SIZE);
   s_msg.result_is_error = result_is_error;
@@ -381,12 +406,14 @@ static volatile uint32_t s_flush_seq = 0;
 
 static void core1_flush_result(void) {
   uint32_t save = spin_lock_blocking(s_spin_lock);
-  size_t len = strnlen(s_msg.result_json, JS_RESULT_MAX_SIZE - 1) + 1;
-  /* Round up to even byte count required by the 16-bit swap macro */
-  size_t copy_len = (len + 1u) & ~1u;
+  size_t len = strnlen(s_msg.result_json, JS_RESULT_MAX_SIZE - 1);
+  /* NUL-pad the source out to the full result buffer, then write the entire
+   * thing. This wipes any stale bytes left in s_result_mem from previous
+   * longer results — regardless of length difference between calls. */
+  memset(s_msg.result_json + len, 0, JS_RESULT_MAX_SIZE - len);
   COPY_AND_CHANGE_ENDIANESS_BLOCK16(s_msg.result_json,
                                     (void *)s_result_mem,
-                                    copy_len);
+                                    JS_RESULT_MAX_SIZE);
   /* Update async status so the ST can see DONE/ERROR before the FIFO push. */
   *s_status_mem = MDJS_BUS_BYTE_WORD(s_msg.result_is_error
                                       ? MDJS_STATUS_ERROR
