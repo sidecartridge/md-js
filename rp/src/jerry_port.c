@@ -15,13 +15,30 @@
 
 /* ── Context (JERRY_EXTERNAL_CONTEXT=ON) ──────────────────────────────────── */
 
+/* JerryScript context lives in a statically-allocated BSS buffer so it doesn't
+ * depend on newlib's malloc (which isn't safe to call from Core 1 on RP2040
+ * before its lazy init has run on the calling core, and races with Core 0's
+ * heap state). Size = jerry_context_t headroom + 48 KB heap.
+ *
+ * JerryScript 3.0's jerry_context_t can be a few KB depending on build flags,
+ * so reserve 8 KB of headroom — plenty, and we still fit inside RAM. */
+#define JERRY_HEAP_BYTES (48u * 1024u)
+#define JERRY_CONTEXT_HEADROOM (8u * 1024u)
+static uint8_t jerry_context_storage[JERRY_HEAP_BYTES + JERRY_CONTEXT_HEADROOM]
+    __attribute__((aligned(8)));
 static jerry_context_t *current_context_p = NULL;
 
 size_t jerry_port_context_alloc(size_t context_size)
 {
-    /* 48 KB heap — must match JERRY_GLOBAL_HEAP_SIZE in CMakeLists.txt */
-    size_t total = context_size + 48u * 1024u;
-    current_context_p = (jerry_context_t *)malloc(total);
+    size_t total = context_size + JERRY_HEAP_BYTES;
+    if (total > sizeof(jerry_context_storage)) {
+        /* Context doesn't fit — log via Core 0's stdio is not safe from
+         * Core 1, so the next-best thing is to leave current_context_p NULL
+         * and let JERRY_CONTEXT_STRUCT fault visibly in the debugger. */
+        current_context_p = NULL;
+        return 0;
+    }
+    current_context_p = (jerry_context_t *)jerry_context_storage;
     return total;
 }
 
@@ -32,7 +49,6 @@ jerry_context_t *jerry_port_context_get(void)
 
 void jerry_port_context_free(void)
 {
-    free(current_context_p);
     current_context_p = NULL;
 }
 

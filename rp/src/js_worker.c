@@ -53,12 +53,22 @@ static volatile uint16_t *s_ready_mem;    /* worker-ready byte at MDJS_READY_OFF
 static bool     s_async_pending;
 static uint64_t s_async_start_us;
 static TransmissionProtocol s_loop_proto;
+
+/* Drain spurious commands that the PIO/protocol parser may pick up during
+ * cold-start before everything is fully initialised. Set true at the end of
+ * js_worker_init(); until then, every consumed command is logged and ignored. */
+static volatile bool s_dispatch_armed = false;
 static char s_core1_result_json[JS_RESULT_MAX_SIZE];
 static char s_core1_call_func[JS_CALL_FUNC_NAME_MAX];
 static char s_core1_call_args_json[JS_CALL_ARGS_MAX];
 
 #define MDJS_BUS_BYTE_WORD(value) ((uint16_t)((uint16_t)(value) << 8))
 #define MDJS_BUS_WORD_BYTE(word)  ((uint8_t)(((uint16_t)(word) >> 8) & 0xFFu))
+
+/* Ready flag: write the magic to BOTH bytes of the bus word so the ST sees the
+ * same byte regardless of which half of the 16-bit word is exposed at the even
+ * address. Removes ambiguity around bus byte-ordering for a single-byte poll. */
+#define MDJS_READY_WORD ((uint16_t)((MDJS_READY_MAGIC << 8) | MDJS_READY_MAGIC))
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static void core1_entry(void);
@@ -81,20 +91,50 @@ static void js_copy_exception_string(jerry_value_t exception_value,
 /* Core 1 — JerryScript runtime                                              */
 /* ────────────────────────────────────────────────────────────────────────── */
 
+/* Core 1 must NOT call DPRINTF / printf — newlib stdio is not dual-core safe
+ * on pico-sdk and concurrent prints from both cores deadlock Core 1 inside
+ * libc. Instead, Core 1 writes a single-byte phase into s_core1_phase and
+ * Core 0 prints transitions from js_worker_loop. */
+static volatile uint8_t s_core1_phase = 0;
+#define C1_PHASE_ENTRY            1
+#define C1_PHASE_PRE_CLEANUP      2
+#define C1_PHASE_PRE_INIT         3
+#define C1_PHASE_POST_INIT        4
+#define C1_PHASE_READY            5
+#define C1_PHASE_LOOPING          6
+#define C1_PHASE_UPLOAD_PARSE_ERR 10
+#define C1_PHASE_UPLOAD_RUN_ERR   11
+#define C1_PHASE_UPLOAD_OK        12
+#define C1_PHASE_CALL_FUNC_FOUND  13
+#define C1_PHASE_CALL_FUNC_MISS   14
+
+static volatile uint8_t s_core1_diag = 0;
+
+/* Larger diagnostic ring — Core 1 stages a NUL-terminated message and bumps
+ * s_core1_diag_seq; Core 0 prints it from js_worker_loop. */
+static volatile uint32_t s_core1_diag_seq = 0;
+static char s_core1_diag_msg[160];
+
 static void core1_entry(void) {
-  DPRINTF("Core 1: MD/JS worker starting\n");
+  s_core1_phase = C1_PHASE_ENTRY;
 
-  /* Always cleanup before init — handles both first-start and post-timeout
-   * restart (jerry_cleanup on an uninitialised context is a no-op). */
-  jerry_cleanup();
+  /* Only cleanup if we've initialised before (i.e. on post-timeout restart).
+   * jerry_cleanup() on a never-initialised context can fault in some builds. */
+  static bool s_core1_initialised = false;
+  if (s_core1_initialised) {
+    s_core1_phase = C1_PHASE_PRE_CLEANUP;
+    jerry_cleanup();
+  }
   *s_ready_mem = 0;
+  s_core1_phase = C1_PHASE_PRE_INIT;
   jerry_init(JERRY_INIT_EMPTY);
-  *s_ready_mem = MDJS_BUS_BYTE_WORD(MDJS_READY_MAGIC);
-
-  DPRINTF("Core 1: JerryScript initialized (heap: %u KB)\n",
-          JERRY_GLOBAL_HEAP_SIZE);
+  s_core1_phase = C1_PHASE_POST_INIT;
+  s_core1_initialised = true;
+  *s_ready_mem = MDJS_READY_WORD;
+  s_core1_phase = C1_PHASE_READY;
 
   while (true) {
+    s_core1_phase = C1_PHASE_LOOPING;
     uint32_t msg = multicore_fifo_pop_blocking();
     uint8_t  tag = (uint8_t)((msg & FIFO_TAG_MASK) >> FIFO_TAG_SHIFT);
 
@@ -126,22 +166,79 @@ static void core1_handle_ping(void) {
 }
 
 static void core1_handle_upload(void) {
-  /* Copy source under lock, then eval without holding it. */
+  /* Copy source under lock, then parse+run without holding it.
+   * We use jerry_parse + jerry_run (not jerry_eval) so function declarations
+   * in the uploaded source register as globals — jerry_eval's indirect-eval
+   * semantics don't always persist function bindings in JerryScript 3.0. */
   uint32_t save = spin_lock_blocking(s_spin_lock);
   uint32_t src_len = s_msg.js_source_len;
   spin_unlock(s_spin_lock, save);
 
-  jerry_value_t result = jerry_eval(
-      (const jerry_char_t *)s_msg.js_source, src_len, JERRY_PARSE_NO_OPTS);
+  jerry_value_t parsed = jerry_parse(
+      (const jerry_char_t *)s_msg.js_source, src_len, NULL);
 
-  bool is_err = jerry_value_is_exception(result);
+  bool is_err = jerry_value_is_exception(parsed);
+  jerry_value_t result;
+
+  /* Build a combined diagnostic line: src_len, hex of first 16 bytes,
+   * printable view of first 80 bytes, and parse-error text if any. */
+  {
+    char err_text[80];
+    err_text[0] = '\0';
+    if (is_err) {
+      js_copy_exception_string(parsed, err_text, sizeof(err_text));
+    }
+    int n = snprintf(s_core1_diag_msg, sizeof(s_core1_diag_msg),
+                     "upload len=%lu hex=", (unsigned long)src_len);
+    size_t hex_n = src_len < 16u ? src_len : 16u;
+    for (size_t i = 0; (i < hex_n) && (n < (int)sizeof(s_core1_diag_msg) - 4);
+         i++) {
+      n += snprintf(s_core1_diag_msg + n,
+                    sizeof(s_core1_diag_msg) - (size_t)n,
+                    "%02X", s_msg.js_source[i]);
+    }
+    if (n < (int)sizeof(s_core1_diag_msg) - 2) {
+      s_core1_diag_msg[n++] = ' ';
+      s_core1_diag_msg[n++] = '\'';
+    }
+    size_t snap = src_len < 60u ? src_len : 60u;
+    for (size_t i = 0; (i < snap) && (n < (int)sizeof(s_core1_diag_msg) - 4);
+         i++) {
+      char c = (char)s_msg.js_source[i];
+      s_core1_diag_msg[n++] = (c >= 0x20 && c <= 0x7E) ? c : '.';
+    }
+    if (n < (int)sizeof(s_core1_diag_msg) - 2) {
+      s_core1_diag_msg[n++] = '\'';
+    }
+    if (is_err && (n < (int)sizeof(s_core1_diag_msg) - 8)) {
+      n += snprintf(s_core1_diag_msg + n,
+                    sizeof(s_core1_diag_msg) - (size_t)n,
+                    " err=%s", err_text);
+    }
+    if (n >= (int)sizeof(s_core1_diag_msg)) {
+      n = (int)sizeof(s_core1_diag_msg) - 1;
+    }
+    s_core1_diag_msg[n] = '\0';
+    s_core1_diag_seq++;
+  }
+
+  if (is_err) {
+    s_core1_diag = C1_PHASE_UPLOAD_PARSE_ERR;
+    result = parsed;
+  } else {
+    result = jerry_run(parsed);
+    jerry_value_free(parsed);
+    is_err = jerry_value_is_exception(result);
+    s_core1_diag = is_err ? C1_PHASE_UPLOAD_RUN_ERR : C1_PHASE_UPLOAD_OK;
+  }
+
   if (is_err) {
     js_copy_exception_string(result, s_core1_result_json,
                              sizeof(s_core1_result_json));
   } else {
     snprintf(s_core1_result_json, sizeof(s_core1_result_json), "{\"ok\":true}");
-    jerry_value_free(result);
   }
+  jerry_value_free(result);
 
   save = spin_lock_blocking(s_spin_lock);
   memcpy(s_msg.result_json, s_core1_result_json, JS_RESULT_MAX_SIZE);
@@ -172,12 +269,14 @@ static void core1_handle_call(void) {
   jerry_value_free(global);
 
   if (!jerry_value_is_function(func_val)) {
+    s_core1_diag = C1_PHASE_CALL_FUNC_MISS;
     snprintf(s_core1_result_json, sizeof(s_core1_result_json),
              "{\"error\":\"function '%s' not found\"}", s_core1_call_func);
     jerry_value_free(func_val);
     result_is_error = true;
     goto write_result;
   }
+  s_core1_diag = C1_PHASE_CALL_FUNC_FOUND;
 
   jerry_value_t args_val = jerry_json_parse(
       (const jerry_char_t *)s_core1_call_args_json,
@@ -254,7 +353,7 @@ static void core1_handle_reset(void) {
   *s_ready_mem = 0;
   jerry_cleanup();
   jerry_init(JERRY_INIT_EMPTY);
-  *s_ready_mem = MDJS_BUS_BYTE_WORD(MDJS_READY_MAGIC);
+  *s_ready_mem = MDJS_READY_WORD;
 
   uint32_t save = spin_lock_blocking(s_spin_lock);
   s_msg.js_source_len    = 0;
@@ -374,13 +473,29 @@ static void __not_in_flash_func(js_write_busy_error)(void) {
 }
 
 /* Parse a CALL payload (func_name\0args_json\0) into s_msg under spin-lock. */
+/* Scratch buffer for byte-swapped CALL payload. Sized to comfortably hold
+ * func_name + args_json. Function names are short (≤63 chars) and demo
+ * args fit easily; full JS_CALL_ARGS_MAX is 2032 bytes but most callers
+ * use a fraction. Keep this modest to limit BSS pressure. */
+#define JS_CALL_SWAP_BUF_SIZE 256
+
 static bool js_parse_call_payload(const uint8_t *payload, size_t payload_size) {
   if (payload_size == 0u) {
     return false;
   }
 
-  const char *func_name = (const char *)payload;
-  const char *fn_end = memchr(func_name, '\0', payload_size);
+  /* The protocol parser stores each 16-bit bus word little-endian, but the
+   * m68k transmitted bytes big-endian. Un-swap pairs into a scratch buffer
+   * so the NUL scans operate on the original byte order. */
+  static uint8_t swapped[JS_CALL_SWAP_BUF_SIZE];
+  if (payload_size > sizeof(swapped)) {
+    return false;
+  }
+  size_t even_size = payload_size & ~(size_t)1u;
+  COPY_AND_CHANGE_ENDIANESS_BLOCK16(payload, swapped, even_size);
+
+  const char *func_name = (const char *)swapped;
+  const char *fn_end = memchr(func_name, '\0', even_size);
   if ((fn_end == NULL) || (fn_end == func_name)) {
     return false;
   }
@@ -391,7 +506,7 @@ static bool js_parse_call_payload(const uint8_t *payload, size_t payload_size) {
   }
 
   const char *args_json = fn_end + 1;
-  size_t args_size = payload_size - fn_len - 1u;
+  size_t args_size = even_size - fn_len - 1u;
   const char *args_end = memchr(args_json, '\0', args_size);
   if (args_end == NULL) {
     return false;
@@ -438,6 +553,8 @@ static void __not_in_flash_func(js_drain_async_fifo)(void) {
 }
 
 static void js_dispatch_command(const TransmissionProtocol *proto) {
+  DPRINTF("js_dispatch: cmd=0x%04X payload=%u\n",
+          proto->command_id, (unsigned)proto->payload_size);
   if (proto->payload_size < 4u) {
     DPRINTF("js_dispatch_command: short payload for 0x%04X\n",
             proto->command_id);
@@ -508,7 +625,16 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
         js_send_response(random_token);
         break;
       }
-      memcpy(s_msg.js_source + s_msg.js_source_len, data, chunk_size);
+      /* The protocol parser stores each 16-bit bus word with little-endian
+       * layout (ARM strh), but the m68k transmitted the bytes in big-endian
+       * order (byte0 in high half of the word). Un-swap pairs while copying
+       * so JerryScript sees the original source text. Demo sources are even
+       * length; odd-length chunks aren't supported yet — round down. */
+      {
+        size_t even_size = (size_t)chunk_size & ~(size_t)1u;
+        COPY_AND_CHANGE_ENDIANESS_BLOCK16(
+            data, s_msg.js_source + s_msg.js_source_len, even_size);
+      }
       s_msg.js_source_len += chunk_size;
       s_msg.chunks_received++;
       bool last_chunk = (s_msg.chunks_received >= s_msg.chunks_expected);
@@ -649,25 +775,88 @@ void js_worker_init(void) {
   uint32_t seed = rand();
   TPROTO_SET_RANDOM_TOKEN(s_token_seed_addr, seed);
 
+  /* Debug sentinel: write a short readable string to the result buffer so the
+   * demo can distinguish "result-buffer plumbing is broken" (sees nothing)
+   * from "CALL path is broken" (sees "BOOT" instead of the call result). */
+  {
+    static const char boot_sentinel[] = "BOOT";
+    /* Round to even byte count for the 16-bit swap macro. */
+    size_t boot_len = (sizeof(boot_sentinel) + 1u) & ~1u;
+    COPY_AND_CHANGE_ENDIANESS_BLOCK16(boot_sentinel,
+                                      (void *)s_result_mem,
+                                      boot_len);
+  }
+
   DPRINTF("js_worker_init: launching Core 1\n");
   multicore_launch_core1(core1_entry);
-  DPRINTF("js_worker_init: Core 1 launched\n");
+  DPRINTF("js_worker_init: Core 1 launched, polling phase...\n");
+
+  /* Poll Core 1's phase byte for up to 5 seconds and print transitions.
+   * This tells us which step in jerry_init hangs without Core 1 calling
+   * printf (which deadlocks on newlib's non-dual-core-safe stdio). */
+  uint8_t last_phase = 0;
+  for (int i = 0; i < 500; i++) {
+    uint8_t phase = s_core1_phase;
+    if (phase != last_phase) {
+      DPRINTF("Core 1 phase -> %u\n", (unsigned)phase);
+      last_phase = phase;
+      if (phase >= C1_PHASE_READY) break;
+    }
+    sleep_ms(10);
+  }
+  if (last_phase < C1_PHASE_READY) {
+    DPRINTF("Core 1 STUCK at phase %u\n", (unsigned)last_phase);
+  }
+
   DPRINTF("MD/JS ready. PING=0x%02X UPLOAD=0x%02X CALL=0x%02X RESET=0x%02X"
           " CALL_ASYNC=0x%02X POLL=0x%02X\n",
           CMD_JS_PING, CMD_JS_UPLOAD, CMD_JS_CALL, CMD_JS_RESET,
           CMD_JS_CALL_ASYNC, CMD_JS_POLL);
+
+  /* Drain anything the protocol parser has already latched. Don't reset the
+   * parser state from Core 0 — it touches shared variables that the DMA IRQ
+   * also writes, and can wedge in-flight frames. */
+  TransmissionProtocol drain;
+  for (int i = 0; i < 50; i++) {
+    while (mdjs_consume_protocol(&drain)) {
+      DPRINTF("js_worker_init: draining startup cmd 0x%04X payload=%u\n",
+              drain.command_id, (unsigned)drain.payload_size);
+    }
+    sleep_ms(1);
+  }
+  s_dispatch_armed = true;
 }
 
 void __not_in_flash_func(js_worker_loop)(void) {
   js_drain_async_fifo();
 
   if (mdjs_consume_protocol(&s_loop_proto)) {
-    if (s_loop_proto.command_id >= CMD_JS_PING &&
-        s_loop_proto.command_id <= CMD_JS_POLL) {
+    if (!s_dispatch_armed) {
+      DPRINTF("js_worker_loop: dropping pre-arm cmd 0x%04X payload=%u\n",
+              s_loop_proto.command_id,
+              (unsigned)s_loop_proto.payload_size);
+    } else if (s_loop_proto.command_id >= CMD_JS_PING &&
+               s_loop_proto.command_id <= CMD_JS_POLL) {
       js_dispatch_command(&s_loop_proto);
     } else {
       DPRINTF("js_worker_loop: ignoring command 0x%04X\n",
               s_loop_proto.command_id);
     }
+  }
+
+  /* Drain Core 1's diagnostic byte (set by upload/call handlers). */
+  static uint8_t last_diag = 0;
+  uint8_t diag = s_core1_diag;
+  if (diag != last_diag) {
+    DPRINTF("Core 1 diag -> %u\n", (unsigned)diag);
+    last_diag = diag;
+  }
+
+  /* Drain Core 1's diagnostic message ring. */
+  static uint32_t last_diag_seq = 0;
+  uint32_t seq = s_core1_diag_seq;
+  if (seq != last_diag_seq) {
+    DPRINTF("Core 1 msg: %s\n", s_core1_diag_msg);
+    last_diag_seq = seq;
   }
 }
