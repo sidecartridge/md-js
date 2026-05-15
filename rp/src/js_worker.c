@@ -47,10 +47,18 @@ static uint32_t s_token_addr;
 static uint32_t s_token_seed_addr;
 static volatile char     *s_result_mem;
 static volatile uint16_t *s_status_mem;   /* async status word at JS_STATUS_OFFSET */
+static volatile uint16_t *s_ready_mem;    /* worker-ready byte at MDJS_READY_OFFSET */
 
 /* Async call state — Core 0 only, no lock needed */
 static bool     s_async_pending;
 static uint64_t s_async_start_us;
+static TransmissionProtocol s_loop_proto;
+static char s_core1_result_json[JS_RESULT_MAX_SIZE];
+static char s_core1_call_func[JS_CALL_FUNC_NAME_MAX];
+static char s_core1_call_args_json[JS_CALL_ARGS_MAX];
+
+#define MDJS_BUS_BYTE_WORD(value) ((uint16_t)((uint16_t)(value) << 8))
+#define MDJS_BUS_WORD_BYTE(word)  ((uint8_t)(((uint16_t)(word) >> 8) & 0xFFu))
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static void core1_entry(void);
@@ -61,9 +69,13 @@ static void core1_handle_reset(void);
 static void core1_flush_result(void);
 static void js_dispatch_command(const TransmissionProtocol *proto);
 static void js_send_response(uint32_t random_token);
+static void js_write_error_response(const char *message);
 static void js_write_busy_error(void);
 static void js_write_timeout_error(void);
-static void js_parse_call_payload(const uint16_t *payload_ptr);
+static bool js_parse_call_payload(const uint8_t *payload, size_t payload_size);
+static void js_copy_exception_string(jerry_value_t exception_value,
+                                     char *dst,
+                                     size_t dst_size);
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Core 1 — JerryScript runtime                                              */
@@ -75,7 +87,9 @@ static void core1_entry(void) {
   /* Always cleanup before init — handles both first-start and post-timeout
    * restart (jerry_cleanup on an uninitialised context is a no-op). */
   jerry_cleanup();
+  *s_ready_mem = 0;
   jerry_init(JERRY_INIT_EMPTY);
+  *s_ready_mem = MDJS_BUS_BYTE_WORD(MDJS_READY_MAGIC);
 
   DPRINTF("Core 1: JerryScript initialized (heap: %u KB)\n",
           JERRY_GLOBAL_HEAP_SIZE);
@@ -121,20 +135,16 @@ static void core1_handle_upload(void) {
       (const jerry_char_t *)s_msg.js_source, src_len, JERRY_PARSE_NO_OPTS);
 
   bool is_err = jerry_value_is_exception(result);
-  save = spin_lock_blocking(s_spin_lock);
   if (is_err) {
-    jerry_value_t err_val = jerry_exception_value(result, false);
-    jerry_value_t err_str = jerry_value_to_string(err_val);
-    jerry_value_free(err_val);
-    jerry_size_t sz = jerry_string_to_buffer(
-        err_str, JERRY_ENCODING_UTF8,
-        (jerry_char_t *)s_msg.result_json, JS_RESULT_MAX_SIZE - 1);
-    s_msg.result_json[sz] = '\0';
-    jerry_value_free(err_str);
+    js_copy_exception_string(result, s_core1_result_json,
+                             sizeof(s_core1_result_json));
   } else {
-    snprintf(s_msg.result_json, JS_RESULT_MAX_SIZE, "{\"ok\":true}");
+    snprintf(s_core1_result_json, sizeof(s_core1_result_json), "{\"ok\":true}");
+    jerry_value_free(result);
   }
-  jerry_value_free(result);
+
+  save = spin_lock_blocking(s_spin_lock);
+  memcpy(s_msg.result_json, s_core1_result_json, JS_RESULT_MAX_SIZE);
   s_msg.result_is_error = is_err;
   spin_unlock(s_spin_lock, save);
 
@@ -148,36 +158,33 @@ static void core1_handle_upload(void) {
 
 static void core1_handle_call(void) {
   /* Copy call parameters under lock, then do all JS work without holding it. */
-  char call_func[JS_CALL_FUNC_NAME_MAX];
-  char call_args_json[JS_CALL_ARGS_MAX];
   uint32_t save = spin_lock_blocking(s_spin_lock);
-  memcpy(call_func, s_msg.call_func, JS_CALL_FUNC_NAME_MAX);
-  memcpy(call_args_json, s_msg.call_args_json, JS_CALL_ARGS_MAX);
+  memcpy(s_core1_call_func, s_msg.call_func, JS_CALL_FUNC_NAME_MAX);
+  memcpy(s_core1_call_args_json, s_msg.call_args_json, JS_CALL_ARGS_MAX);
   spin_unlock(s_spin_lock, save);
 
-  char result_json[JS_RESULT_MAX_SIZE];
   bool result_is_error;
 
   jerry_value_t global    = jerry_current_realm();
-  jerry_value_t fname_str = jerry_string_sz(call_func);
+  jerry_value_t fname_str = jerry_string_sz(s_core1_call_func);
   jerry_value_t func_val  = jerry_object_get(global, fname_str);
   jerry_value_free(fname_str);
   jerry_value_free(global);
 
   if (!jerry_value_is_function(func_val)) {
-    snprintf(result_json, JS_RESULT_MAX_SIZE,
-             "{\"error\":\"function '%s' not found\"}", call_func);
+    snprintf(s_core1_result_json, sizeof(s_core1_result_json),
+             "{\"error\":\"function '%s' not found\"}", s_core1_call_func);
     jerry_value_free(func_val);
     result_is_error = true;
     goto write_result;
   }
 
   jerry_value_t args_val = jerry_json_parse(
-      (const jerry_char_t *)call_args_json,
-      strlen(call_args_json));
+      (const jerry_char_t *)s_core1_call_args_json,
+      strlen(s_core1_call_args_json));
 
   if (jerry_value_is_exception(args_val)) {
-    snprintf(result_json, JS_RESULT_MAX_SIZE,
+    snprintf(s_core1_result_json, sizeof(s_core1_result_json),
              "{\"error\":\"invalid args JSON\"}");
     jerry_value_free(args_val);
     jerry_value_free(func_val);
@@ -210,28 +217,22 @@ static void core1_handle_call(void) {
   jerry_value_free(func_val);
 
   if (jerry_value_is_exception(ret)) {
-    jerry_value_t err_val = jerry_exception_value(ret, false);
-    jerry_value_t err_str = jerry_value_to_string(err_val);
-    jerry_value_free(err_val);
-    jerry_size_t sz = jerry_string_to_buffer(
-        err_str, JERRY_ENCODING_UTF8,
-        (jerry_char_t *)result_json, JS_RESULT_MAX_SIZE - 1);
-    result_json[sz] = '\0';
-    jerry_value_free(err_str);
+    js_copy_exception_string(ret, s_core1_result_json,
+                             sizeof(s_core1_result_json));
     result_is_error = true;
   } else {
     jerry_value_t json_str = jerry_json_stringify(ret);
     jerry_value_free(ret);
-    if (jerry_value_is_exception(json_str)) {
-      snprintf(result_json, JS_RESULT_MAX_SIZE,
-               "{\"error\":\"result not JSON-serialisable\"}");
+    if (jerry_value_is_exception(json_str) || !jerry_value_is_string(json_str)) {
       jerry_value_free(json_str);
+      snprintf(s_core1_result_json, sizeof(s_core1_result_json),
+               "{\"error\":\"result not JSON-serialisable\"}");
       result_is_error = true;
     } else {
       jerry_size_t sz = jerry_string_to_buffer(
           json_str, JERRY_ENCODING_UTF8,
-          (jerry_char_t *)result_json, JS_RESULT_MAX_SIZE - 1);
-      result_json[sz] = '\0';
+          (jerry_char_t *)s_core1_result_json, JS_RESULT_MAX_SIZE - 1);
+      s_core1_result_json[sz] = '\0';
       jerry_value_free(json_str);
       result_is_error = false;
     }
@@ -239,11 +240,10 @@ static void core1_handle_call(void) {
 
 write_result:
   save = spin_lock_blocking(s_spin_lock);
-  memcpy(s_msg.result_json, result_json, JS_RESULT_MAX_SIZE);
+  memcpy(s_msg.result_json, s_core1_result_json, JS_RESULT_MAX_SIZE);
   s_msg.result_is_error = result_is_error;
   spin_unlock(s_spin_lock, save);
 
-done:
   core1_flush_result();
   multicore_fifo_push_blocking(
       (uint32_t)(s_msg.result_is_error ? FIFO_MSG_ERROR : FIFO_MSG_DONE)
@@ -251,8 +251,10 @@ done:
 }
 
 static void core1_handle_reset(void) {
+  *s_ready_mem = 0;
   jerry_cleanup();
   jerry_init(JERRY_INIT_EMPTY);
+  *s_ready_mem = MDJS_BUS_BYTE_WORD(MDJS_READY_MAGIC);
 
   uint32_t save = spin_lock_blocking(s_spin_lock);
   s_msg.js_source_len    = 0;
@@ -281,9 +283,9 @@ static void core1_flush_result(void) {
                                     (void *)s_result_mem,
                                     copy_len);
   /* Update async status so the ST can see DONE/ERROR before the FIFO push. */
-  *s_status_mem = (uint16_t)(s_msg.result_is_error
-                              ? MDJS_STATUS_ERROR
-                              : MDJS_STATUS_DONE);
+  *s_status_mem = MDJS_BUS_BYTE_WORD(s_msg.result_is_error
+                                      ? MDJS_STATUS_ERROR
+                                      : MDJS_STATUS_DONE);
   spin_unlock(s_spin_lock, save);
 }
 
@@ -316,11 +318,31 @@ static uint8_t js_wait_for_core1(void) {
 
     /* Reset Core 1. jerry_cleanup() is called at the top of core1_entry()
      * before re-init, so the old heap is always freed on restart. */
+    *s_ready_mem = 0;
     multicore_reset_core1();
     multicore_launch_core1(core1_entry);
     return FIFO_MSG_ERROR;
   }
   return (uint8_t)((resp & FIFO_TAG_MASK) >> FIFO_TAG_SHIFT);
+}
+
+static void js_copy_exception_string(jerry_value_t exception_value,
+                                     char *dst,
+                                     size_t dst_size) {
+  jerry_value_t err_val = jerry_exception_value(exception_value, true);
+  jerry_value_t err_str = jerry_value_to_string(err_val);
+  jerry_value_free(err_val);
+
+  if (jerry_value_is_exception(err_str)) {
+    snprintf(dst, dst_size, "{\"error\":\"exception\"}");
+    jerry_value_free(err_str);
+    return;
+  }
+
+  jerry_size_t sz = jerry_string_to_buffer(
+      err_str, JERRY_ENCODING_UTF8, (jerry_char_t *)dst, dst_size - 1);
+  dst[sz] = '\0';
+  jerry_value_free(err_str);
 }
 
 /* Write an error JSON literal to the result buffer and update the status word.
@@ -331,28 +353,62 @@ static void js_write_timeout_error(void) {
   size_t len      = strnlen(s_msg.result_json, JS_RESULT_MAX_SIZE - 1) + 1;
   size_t copy_len = (len + 1u) & ~1u;
   COPY_AND_CHANGE_ENDIANESS_BLOCK16(s_msg.result_json, (void *)s_result_mem, copy_len);
-  *s_status_mem = (uint16_t)MDJS_STATUS_ERROR;
+  *s_status_mem = MDJS_BUS_BYTE_WORD(MDJS_STATUS_ERROR);
+}
+
+static void __not_in_flash_func(js_write_error_response)(const char *message) {
+  uint32_t save = spin_lock_blocking(s_spin_lock);
+  snprintf(s_msg.result_json, JS_RESULT_MAX_SIZE, "{\"error\":\"%s\"}", message);
+  s_msg.result_is_error = true;
+  size_t len = strnlen(s_msg.result_json, JS_RESULT_MAX_SIZE - 1) + 1;
+  size_t copy_len = (len + 1u) & ~1u;
+  COPY_AND_CHANGE_ENDIANESS_BLOCK16(s_msg.result_json, (void *)s_result_mem,
+                                    copy_len);
+  *s_status_mem = MDJS_BUS_BYTE_WORD(MDJS_STATUS_ERROR);
+  spin_unlock(s_spin_lock, save);
 }
 
 /* Write the "busy" error JSON to the result buffer (sizeof includes NUL). */
 static void __not_in_flash_func(js_write_busy_error)(void) {
-  static const char busy[] = "{\"error\":\"busy\"}";
-  size_t blen = (sizeof(busy) + 1u) & ~1u;
-  COPY_AND_CHANGE_ENDIANESS_BLOCK16((void *)busy, (void *)s_result_mem, blen);
+  js_write_error_response("busy");
 }
 
 /* Parse a CALL payload (func_name\0args_json\0) into s_msg under spin-lock. */
-static void js_parse_call_payload(const uint16_t *payload_ptr) {
-  const char *func_name = (const char *)payload_ptr;
-  size_t      fn_len    = strnlen(func_name, JS_CALL_FUNC_NAME_MAX);
-  const char *args_json = func_name + fn_len + 1;
+static bool js_parse_call_payload(const uint8_t *payload, size_t payload_size) {
+  if (payload_size == 0u) {
+    return false;
+  }
+
+  const char *func_name = (const char *)payload;
+  const char *fn_end = memchr(func_name, '\0', payload_size);
+  if ((fn_end == NULL) || (fn_end == func_name)) {
+    return false;
+  }
+
+  size_t fn_len = (size_t)(fn_end - func_name);
+  if (fn_len >= JS_CALL_FUNC_NAME_MAX) {
+    return false;
+  }
+
+  const char *args_json = fn_end + 1;
+  size_t args_size = payload_size - fn_len - 1u;
+  const char *args_end = memchr(args_json, '\0', args_size);
+  if (args_end == NULL) {
+    return false;
+  }
+
+  size_t args_len = (size_t)(args_end - args_json);
+  if (args_len >= JS_CALL_ARGS_MAX) {
+    return false;
+  }
 
   uint32_t save = spin_lock_blocking(s_spin_lock);
-  strncpy(s_msg.call_func, func_name, JS_CALL_FUNC_NAME_MAX - 1);
-  s_msg.call_func[JS_CALL_FUNC_NAME_MAX - 1] = '\0';
-  strncpy(s_msg.call_args_json, args_json, JS_CALL_ARGS_MAX - 1);
-  s_msg.call_args_json[JS_CALL_ARGS_MAX - 1] = '\0';
+  memcpy(s_msg.call_func, func_name, fn_len);
+  s_msg.call_func[fn_len] = '\0';
+  memcpy(s_msg.call_args_json, args_json, args_len);
+  s_msg.call_args_json[args_len] = '\0';
   spin_unlock(s_spin_lock, save);
+  return true;
 }
 
 /**
@@ -369,6 +425,7 @@ static void __not_in_flash_func(js_drain_async_fifo)(void) {
     js_write_timeout_error();
     spin_unlock(s_spin_lock, save);
     s_async_pending = false;
+    *s_ready_mem = 0;
     multicore_reset_core1();
     multicore_launch_core1(core1_entry);
     return;
@@ -381,6 +438,12 @@ static void __not_in_flash_func(js_drain_async_fifo)(void) {
 }
 
 static void js_dispatch_command(const TransmissionProtocol *proto) {
+  if (proto->payload_size < 4u) {
+    DPRINTF("js_dispatch_command: short payload for 0x%04X\n",
+            proto->command_id);
+    return;
+  }
+
   uint32_t  random_token = TPROTO_GET_RANDOM_TOKEN(proto->payload);
   uint16_t *payload_ptr  = (uint16_t *)proto->payload;
 
@@ -396,13 +459,41 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
 
     /* ── CMD_JS_UPLOAD ────────────────────────────────────────────────── */
     case CMD_JS_UPLOAD: {
+      if (proto->payload_size < JS_UPLOAD_HDR_SIZE) {
+        js_write_error_response("bad upload payload");
+        js_send_response(random_token);
+        break;
+      }
+
       /* Skip the 4-byte random token */
       TPROTO_NEXT32_PAYLOAD_PTR(payload_ptr);
 
-      uint16_t chunk_idx    = TPROTO_GET_NEXT16_PAYLOAD_PARAM16(payload_ptr);
-      uint16_t total_chunks = TPROTO_GET_NEXT16_PAYLOAD_PARAM16(payload_ptr);
-      uint16_t chunk_size   = TPROTO_GET_NEXT16_PAYLOAD_PARAM16(payload_ptr);
+      uint32_t chunk_idx32 = TPROTO_GET_PAYLOAD_PARAM32(payload_ptr);
+      TPROTO_NEXT32_PAYLOAD_PTR(payload_ptr);
+      uint32_t total_chunks32 = TPROTO_GET_PAYLOAD_PARAM32(payload_ptr);
+      TPROTO_NEXT32_PAYLOAD_PTR(payload_ptr);
+      uint32_t chunk_size32 = TPROTO_GET_PAYLOAD_PARAM32(payload_ptr);
+      TPROTO_NEXT32_PAYLOAD_PTR(payload_ptr);
       const uint8_t *data   = (const uint8_t *)payload_ptr;
+      uint16_t data_size = proto->payload_size - JS_UPLOAD_HDR_SIZE;
+
+      if ((chunk_idx32 > UINT16_MAX) || (total_chunks32 > UINT16_MAX) ||
+          (chunk_size32 > UINT16_MAX)) {
+        js_write_error_response("bad upload header");
+        js_send_response(random_token);
+        break;
+      }
+
+      uint16_t chunk_idx = (uint16_t)chunk_idx32;
+      uint16_t total_chunks = (uint16_t)total_chunks32;
+      uint16_t chunk_size = (uint16_t)chunk_size32;
+
+      if ((total_chunks == 0u) || (chunk_idx >= total_chunks) ||
+          (chunk_size > data_size) || (chunk_size > JS_UPLOAD_CHUNK_MAX)) {
+        js_write_error_response("bad upload header");
+        js_send_response(random_token);
+        break;
+      }
 
       uint32_t save = spin_lock_blocking(s_spin_lock);
       if (chunk_idx == 0) {
@@ -411,9 +502,14 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
         s_msg.chunks_expected = total_chunks;
       }
       uint32_t avail = JS_SOURCE_MAX - s_msg.js_source_len;
-      uint32_t copy  = (chunk_size < avail) ? chunk_size : avail;
-      memcpy(s_msg.js_source + s_msg.js_source_len, data, copy);
-      s_msg.js_source_len += copy;
+      if (chunk_size > avail) {
+        spin_unlock(s_spin_lock, save);
+        js_write_error_response("source too large");
+        js_send_response(random_token);
+        break;
+      }
+      memcpy(s_msg.js_source + s_msg.js_source_len, data, chunk_size);
+      s_msg.js_source_len += chunk_size;
       s_msg.chunks_received++;
       bool last_chunk = (s_msg.chunks_received >= s_msg.chunks_expected);
       spin_unlock(s_spin_lock, save);
@@ -444,9 +540,19 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
         break;
       }
 
-      /* Skip the 4-byte random token */
-      TPROTO_NEXT32_PAYLOAD_PTR(payload_ptr);
-      js_parse_call_payload(payload_ptr);
+      if (proto->payload_size <= JS_CALL_HDR_SIZE) {
+        js_write_error_response("bad call payload");
+        js_send_response(random_token);
+        break;
+      }
+
+      const uint8_t *call_payload = proto->payload + JS_CALL_HDR_SIZE;
+      size_t call_payload_size = proto->payload_size - JS_CALL_HDR_SIZE;
+      if (!js_parse_call_payload(call_payload, call_payload_size)) {
+        js_write_error_response("bad call payload");
+        js_send_response(random_token);
+        break;
+      }
 
       multicore_fifo_push_blocking((uint32_t)FIFO_MSG_CALL << FIFO_TAG_SHIFT);
       js_wait_for_core1();
@@ -471,11 +577,21 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
         break;
       }
 
-      /* Skip the 4-byte random token */
-      TPROTO_NEXT32_PAYLOAD_PTR(payload_ptr);
-      js_parse_call_payload(payload_ptr);
+      if (proto->payload_size <= JS_CALL_HDR_SIZE) {
+        js_write_error_response("bad call payload");
+        js_send_response(random_token);
+        break;
+      }
 
-      *s_status_mem      = (uint16_t)MDJS_STATUS_BUSY;
+      const uint8_t *call_payload = proto->payload + JS_CALL_HDR_SIZE;
+      size_t call_payload_size = proto->payload_size - JS_CALL_HDR_SIZE;
+      if (!js_parse_call_payload(call_payload, call_payload_size)) {
+        js_write_error_response("bad call payload");
+        js_send_response(random_token);
+        break;
+      }
+
+      *s_status_mem      = MDJS_BUS_BYTE_WORD(MDJS_STATUS_BUSY);
       s_async_pending    = true;
       s_async_start_us   = time_us_64();
 
@@ -490,7 +606,7 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
       /* Write current async status as JSON into the result buffer */
       char status_json[32];
       snprintf(status_json, sizeof(status_json),
-               "{\"status\":%u}", (unsigned)*s_status_mem);
+               "{\"status\":%u}", (unsigned)MDJS_BUS_WORD_BYTE(*s_status_mem));
       size_t slen = ((strnlen(status_json, sizeof(status_json) - 1) + 2u) & ~1u);
       COPY_AND_CHANGE_ENDIANESS_BLOCK16((void *)status_json,
                                         (void *)s_result_mem,
@@ -516,7 +632,9 @@ void js_worker_init(void) {
   s_token_seed_addr  = s_rom_base + MDJS_RANDOM_TOKEN_SEED_OFFSET;
   s_result_mem       = (volatile char    *)(s_rom_base + JS_RESULT_OFFSET);
   s_status_mem       = (volatile uint16_t *)(s_rom_base + JS_STATUS_OFFSET);
-  *s_status_mem      = (uint16_t)MDJS_STATUS_IDLE;
+  s_ready_mem        = (volatile uint16_t *)(s_rom_base + MDJS_READY_OFFSET);
+  *s_status_mem      = MDJS_BUS_BYTE_WORD(MDJS_STATUS_IDLE);
+  *s_ready_mem       = 0;
   s_async_pending    = false;
   s_async_start_us   = 0;
 
@@ -543,14 +661,13 @@ void js_worker_init(void) {
 void __not_in_flash_func(js_worker_loop)(void) {
   js_drain_async_fifo();
 
-  TransmissionProtocol proto = {0};
-  if (mdjs_consume_protocol(&proto)) {
-    if (proto.command_id >= CMD_JS_PING &&
-        proto.command_id <= CMD_JS_POLL) {
-      js_dispatch_command(&proto);
+  if (mdjs_consume_protocol(&s_loop_proto)) {
+    if (s_loop_proto.command_id >= CMD_JS_PING &&
+        s_loop_proto.command_id <= CMD_JS_POLL) {
+      js_dispatch_command(&s_loop_proto);
     } else {
       DPRINTF("js_worker_loop: ignoring command 0x%04X\n",
-              proto.command_id);
+              s_loop_proto.command_id);
     }
   }
 }

@@ -233,14 +233,14 @@ if(NOT RELEASE_DATE)
         set(RELEASE_DATE ${CURRENT_DATE_TIME})
 endif()
 
-if (NOT _DEBUG)
+if("${_DEBUG}" STREQUAL "")
         set(_DEBUG 1)
 endif()
 
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
 # Workaround to disable USB output in release builds
-if(${_DEBUG} STREQUAL "0")
+if("${_DEBUG}" STREQUAL "0")
     pico_enable_stdio_uart(${PROJECT_NAME} 0)
 else()
     pico_enable_stdio_uart(${PROJECT_NAME} 1)

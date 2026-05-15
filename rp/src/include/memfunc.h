@@ -11,26 +11,35 @@
 #ifndef MEMFUNC_H
 #define MEMFUNC_H
 
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
 #include "constants.h"
 #include "debug.h"
 #include "hardware/dma.h"
 #include "hardware/structs/xip_ctrl.h"
 
-#define COPY_FIRMWARE_TO_RAM(emulROM, emulROM_length)  \
-  do {                                                 \
+#define COPY_FIRMWARE_TO_RAM(emulROM, emulROM_length) \
+  do {                                                \
+    ERASE_FIRMWARE_IN_RAM();                          \
     COPY_FIRMWARE_TO_RAM_DMA(emulROM, emulROM_length); \
   } while (0)
 
 #define ERASE_FIRMWARE_IN_RAM()                                \
   do {                                                         \
-    memset((void *)&__rom_in_ram_start__, 0,                   \
-           ROM_SIZE_LONGWORDS * ROM_BANKS * sizeof(uint32_t)); \
+    volatile uint32_t *__rom_words =                           \
+        (volatile uint32_t *)&__rom_in_ram_start__;            \
+    for (size_t __i = 0; __i < (ROM_SIZE_LONGWORDS * ROM_BANKS); ++__i) { \
+      __rom_words[__i] = 0;                                    \
+    }                                                          \
     DPRINTF("RAM for the firmware zeroed.\n");                 \
   } while (0)
 
 #define COPY_FIRMWARE_TO_RAM_MEMCPY(emulROM, emulROM_length) \
   do {                                                       \
-    memcpy(&__rom_in_ram_start__, emulROM, emulROM_length);  \
+    memcpy(&__rom_in_ram_start__, emulROM,                   \
+           (size_t)(emulROM_length) * sizeof(uint16_t));     \
     DPRINTF("Emulation firmware copied to RAM.\n");          \
   } while (0)
 
@@ -49,8 +58,10 @@
       }                                                                        \
       break;                                                                   \
     }                                                                         \
+    size_t __copy_words = (size_t)(emulROM_length);                           \
+    size_t __copy_longwords = __copy_words / 2u;                              \
     xip_ctrl_hw->stream_addr = (uint32_t)&(emulROM)[0];                       \
-    xip_ctrl_hw->stream_ctr = (emulROM_length) / 2;                           \
+    xip_ctrl_hw->stream_ctr = __copy_longwords;                               \
     dma_channel_config cfg = dma_channel_get_default_config(dma_chan);        \
     channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);                 \
     channel_config_set_read_increment(&cfg, false);                           \
@@ -59,11 +70,15 @@
     dma_channel_configure(dma_chan, &cfg,                                     \
                           (void *)&__rom_in_ram_start__, /* Write addr */     \
                           (const void *)XIP_AUX_BASE,    /* Read addr */      \
-                          (emulROM_length) / 2,          /* Transfer count */ \
+                          __copy_longwords,              /* Transfer count */ \
                           true /* Start immediately! */                       \
     );                                                                        \
     dma_channel_wait_for_finish_blocking(dma_chan);                           \
     dma_channel_unclaim((uint)dma_chan);                                      \
+    if ((__copy_words & 1u) != 0u) {                                          \
+      ((volatile uint16_t *)&__rom_in_ram_start__)[__copy_words - 1u] =       \
+          ((const uint16_t *)(emulROM))[__copy_words - 1u];                   \
+    }                                                                         \
   } while (0)
 
 #define CHANGE_ENDIANESS_BLOCK16(dest_ptr_word, size_in_bytes) \

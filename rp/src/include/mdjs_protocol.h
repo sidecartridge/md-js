@@ -14,6 +14,8 @@
 /* Shared ROM-in-RAM offsets used by the ST protocol helpers. */
 #define MDJS_RANDOM_TOKEN_OFFSET      0xF000
 #define MDJS_RANDOM_TOKEN_SEED_OFFSET (MDJS_RANDOM_TOKEN_OFFSET + 4)
+#define MDJS_READY_OFFSET             0xF00A
+#define MDJS_READY_MAGIC              0x4A
 
 /**
  * @brief DMA lookup IRQ callback used by ROM emulation.

@@ -31,6 +31,9 @@ RANDOM_TOKEN_ADDR:        equ (ROM4_ADDR + $F000) 	      ; Random token address 
 RANDOM_TOKEN_SEED_ADDR:   equ (RANDOM_TOKEN_ADDR + 4) 	  ; RANDOM_TOKEN_ADDR + 4 bytes
 RANDOM_TOKEN_POST_WAIT:   equ $1        		      	  ; Wait this cycles after the random number generator is ready
 COMMAND_TIMEOUT           equ $0000FFFF                   ; Timeout for the command
+MDJS_READY_ADDR           equ (ROM4_ADDR + $F00A)         ; Worker-ready byte written by RP2040
+MDJS_READY_MAGIC          equ $4A                         ; Must match MDJS_READY_MAGIC in mdjs_protocol.h
+MDJS_BOOT_READY_TIMEOUT   equ 250                         ; VBL polls before reporting not detected
 
 SHARED_VARIABLES:     	  equ (RANDOM_TOKEN_ADDR + $200)  ; random token + 512 bytes to the shared variables area: $FAF200
 
@@ -104,7 +107,8 @@ pre_auto:
 	; Copy the code out of the ROM to avoid unstable behavior
     move.l #end_rom_code - start_rom_code, d6
     lea start_rom_code, a1    ; a1 points to the start of the code in ROM
-    lsr.w #2, d6
+    addq.l #3, d6
+    lsr.l #2, d6
     subq #1, d6
 .copy_rom_code:
     move.l (a1)+, (a2)+
@@ -112,21 +116,18 @@ pre_auto:
 	jmp (a3)
 
 start_rom_code:
-; Detect MD/JS worker (ping the RP2040 with CMD_JS_PING)
+; Detect MD/JS worker by polling the ready byte written by the RP2040 after
+; Core 1 has finished jerry_init().
 ; D7 = 1 if worker is available, 0 otherwise (used by boot_gem path)
-; Wait ~1 second (50 VBL ticks on PAL / 60 on NTSC) so the RP2040 has time
-; to bring up JerryScript before we ping it, otherwise the first ping
-; usually races the worker and reports "not detected".
-	move.w #50, d6
-.js_detect_delay:
+	move.w #MDJS_BOOT_READY_TIMEOUT, d6
+	clr.l d7
+.js_detect_poll:
+	cmpi.b #MDJS_READY_MAGIC, (MDJS_READY_ADDR).l
+	beq.s .js_found
 	move.w #37, -(sp)			; XBIOS Vsync — wait for next vertical blank
 	trap #14
 	addq.l #2, sp
-	dbf d6, .js_detect_delay
-	send_sync CMD_JS_PING, 4	; payload = random token only (4 bytes)
-	tst.w d0					; D0 = 0 on success, non-zero on timeout/error
-	beq.s .js_found
-	clr.l d7					; Worker not detected
+	dbf d6, .js_detect_poll
 	bra.s .js_detect_done
 .js_found:
 	move.l #1, d7				; Worker detected
@@ -156,53 +157,108 @@ boot_gem:
 	rts
 
 ; Cartridge-resident MD/JS demo app.
-; Registers as a GEM app (AES), runs ping/upload/call, then shows result.
+; The cartridge entry only copies the demo block to RAM. The demo has mutable
+; AES control/data blocks, so running it directly from ROM would bus-error.
 mdjsdemo_cart_run:
 	movem.l d2-d7/a2-a6,-(sp)
+	move.l sp, a6
 
+	move.l #mdjsdemo_ram_end - mdjsdemo_ram_start, -(sp)
+	move.w #Malloc, -(sp)
+	trap #1
+	addq.l #6, sp
+	tst.l d0
+	bgt.s .mdjsdemo_got_malloc
+
+; Some TOS cartridge launch paths do not provide a usable GEMDOS Malloc arena.
+; Fall back to a small stack-resident copy so the mutable AES block still runs
+; from RAM rather than cartridge ROM.
+	moveq #0, d4
+	move.l #mdjsdemo_ram_end - mdjsdemo_ram_start, d0
+	addq.l #1, d0
+	and.l #$FFFFFFFE, d0
+	sub.l d0, sp
+	move.l sp, a3
+	bra.s .mdjsdemo_copy_ram
+
+.mdjsdemo_got_malloc:
+	moveq #1, d4
+	move.l d0, a3
+.mdjsdemo_copy_ram:
+	move.l a3, a2
+	lea mdjsdemo_ram_start(pc), a1
+	move.l #mdjsdemo_ram_end - mdjsdemo_ram_start, d6
+	addq.l #1, d6
+	lsr.l #1, d6
+	subq.w #1, d6
+.mdjsdemo_copy_loop:
+	move.w (a1)+, (a2)+
+	dbf d6, .mdjsdemo_copy_loop
+
+	jsr (a3)
+
+	tst.w d4
+	beq.s .mdjsdemo_restore_stack
+	move.l a3, -(sp)
+	move.w #Mfree, -(sp)
+	trap #1
+	addq.l #6, sp
+
+.mdjsdemo_restore_stack:
+	move.l a6, sp
+.mdjsdemo_launcher_done:
+	movem.l (sp)+,d2-d7/a2-a6
+	rts
+
+mdjsdemo_ram_start:
+mdjsdemo_ram_entry:
+	movem.l d2-d7/a2-a6,-(sp)
+
+	bsr mdjsdemo_setup_aespb
 	bsr mdjsdemo_aes_init
 	tst.w d0
 	bmi .mdjsdemo_no_aes
 
-	send_sync CMD_JS_PING, 4
+	send_sync CMD_JS_PING, 0
 	tst.w d0
 	beq .mdjsdemo_ping_ok
-	lea mdjsdemo_alert_worker_missing, a0
+	lea mdjsdemo_alert_worker_missing(pc), a0
 	bsr mdjsdemo_form_alert
 	bra .mdjsdemo_exit_aes
 .mdjsdemo_ping_ok:
 
-	lea mdjsdemo_upload_source, a4
+	lea mdjsdemo_upload_source(pc), a4
 	moveq #0, d3
 	moveq #1, d4
 	move.l #MDJS_UPLOAD_SOURCE_LEN, d5
 	send_write_sync CMD_JS_UPLOAD, MDJS_UPLOAD_SOURCE_LEN
 	tst.w d0
 	beq .mdjsdemo_upload_ok
-	lea mdjsdemo_alert_upload_failed, a0
+	lea mdjsdemo_alert_upload_failed(pc), a0
 	bsr mdjsdemo_form_alert
 	bra .mdjsdemo_exit_aes
 .mdjsdemo_upload_ok:
 
-	lea mdjsdemo_call_payload, a4
+	lea mdjsdemo_call_payload(pc), a4
 	moveq #0, d3
 	moveq #1, d4
 	move.l #MDJS_CALL_PAYLOAD_LEN, d5
 	send_write_sync CMD_JS_CALL, MDJS_CALL_PAYLOAD_LEN
 	tst.w d0
 	beq .mdjsdemo_call_ok
-	lea mdjsdemo_alert_call_failed, a0
+	lea mdjsdemo_alert_call_failed(pc), a0
 	bsr mdjsdemo_form_alert
 	bra .mdjsdemo_exit_aes
 .mdjsdemo_call_ok:
 
 	bsr mdjsdemo_build_success_alert
-	lea mdjsdemo_alert_buffer, a0
+	lea mdjsdemo_alert_buffer(pc), a0
 	bsr mdjsdemo_form_alert
 	bra .mdjsdemo_exit_aes
 
 .mdjsdemo_no_aes:
-	pea mdjsdemo_noaes_msg
+	lea mdjsdemo_noaes_msg(pc), a0
+	move.l a0, -(sp)
 	move.w #Cconws, -(sp)
 	trap #1
 	addq.l #6, sp
@@ -215,48 +271,73 @@ mdjsdemo_cart_run:
 	movem.l (sp)+,d2-d7/a2-a6
 	rts
 
+mdjsdemo_setup_aespb:
+	lea mdjsdemo_aespb(pc), a0
+	lea mdjsdemo_aes_ctrl_appl_init(pc), a1
+	move.l a1, (a0)+
+	lea mdjsdemo_aes_global(pc), a1
+	move.l a1, (a0)+
+	lea mdjsdemo_aes_intin(pc), a1
+	move.l a1, (a0)+
+	lea mdjsdemo_aes_intout(pc), a1
+	move.l a1, (a0)+
+	lea mdjsdemo_aes_addrin(pc), a1
+	move.l a1, (a0)+
+	lea mdjsdemo_aes_addrout(pc), a1
+	move.l a1, (a0)+
+	rts
+
 mdjsdemo_aes:
 	move.w #$C8, d0
-	lea mdjsdemo_aespb, a0
+	lea mdjsdemo_aespb(pc), a0
 	move.l a0, d1
 	trap #2
-	move.w mdjsdemo_aes_intout, d0
+	lea mdjsdemo_aes_intout(pc), a0
+	move.w (a0), d0
 	rts
 
 mdjsdemo_aes_init:
-	move.l #mdjsdemo_aes_ctrl_appl_init, mdjsdemo_aespb
+	lea mdjsdemo_aes_ctrl_appl_init(pc), a0
+	lea mdjsdemo_aespb(pc), a1
+	move.l a0, (a1)
 	bsr mdjsdemo_aes
 	rts
 
 mdjsdemo_aes_exit:
-	move.l #mdjsdemo_aes_ctrl_appl_exit, mdjsdemo_aespb
+	lea mdjsdemo_aes_ctrl_appl_exit(pc), a0
+	lea mdjsdemo_aespb(pc), a1
+	move.l a0, (a1)
 	bsr mdjsdemo_aes
 	rts
 
 ; a0 = pointer to alert string "[#][lines][buttons]"
 mdjsdemo_form_alert:
-	move.w #1, mdjsdemo_aes_intin
-	move.l a0, mdjsdemo_aes_addrin
-	move.l #mdjsdemo_aes_ctrl_form_alert, mdjsdemo_aespb
+	lea mdjsdemo_aes_intin(pc), a1
+	move.w #1, (a1)
+	lea mdjsdemo_aes_addrin(pc), a1
+	move.l a0, (a1)
+	lea mdjsdemo_aes_ctrl_form_alert(pc), a0
+	lea mdjsdemo_aespb(pc), a1
+	move.l a0, (a1)
 	bsr mdjsdemo_aes
 	rts
 
 mdjsdemo_build_success_alert:
-	lea mdjsdemo_alert_buffer, a0
-	lea mdjsdemo_alert_prefix, a1
+	lea mdjsdemo_alert_buffer(pc), a0
+	lea mdjsdemo_alert_prefix(pc), a1
 	bsr mdjsdemo_append_cstr
 	bsr mdjsdemo_append_result
 	tst.w d6
 	beq .build_success_no_result
 	tst.w d5
 	beq .build_success_no_result
-	lea mdjsdemo_alert_suffix, a1
+	lea mdjsdemo_alert_suffix(pc), a1
 	bsr mdjsdemo_append_cstr
 	clr.b (a0)
 	rts
 .build_success_no_result:
-	lea mdjsdemo_alert_buffer, a0
-	lea mdjsdemo_alert_no_result, a1
+	lea mdjsdemo_alert_buffer(pc), a0
+	lea mdjsdemo_alert_no_result(pc), a1
 	bsr mdjsdemo_append_cstr
 	clr.b (a0)
 	rts
@@ -331,12 +412,7 @@ mdjsdemo_aes_ctrl_form_alert:
 	dc.w 52,1,1,1,0
 
 mdjsdemo_aespb:
-	dc.l mdjsdemo_aes_ctrl_appl_init
-	dc.l mdjsdemo_aes_global
-	dc.l mdjsdemo_aes_intin
-	dc.l mdjsdemo_aes_intout
-	dc.l mdjsdemo_aes_addrin
-	dc.l mdjsdemo_aes_addrout
+	ds.l 6
 
 mdjsdemo_aes_global:
 	ds.w 16
@@ -387,12 +463,12 @@ mdjsdemo_alert_buffer:
 	ds.b 128
 	even
 
-end_mdjsdemo:
-
 ; Shared functions included at the end of the file
 ; Don't forget to include the macros for the shared functions at the top of file
     include "inc/sidecart_functions.s"
 
+mdjsdemo_ram_end:
+end_mdjsdemo:
 
 end_rom_code:
 end_pre_auto:

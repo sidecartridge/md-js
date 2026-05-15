@@ -349,6 +349,8 @@ _copy_sync_code_write:
     ;
     ; SEND MEMORY BUFFER TO WRITE
     ;
+    tst.l d6
+    beq _no_more_payload_write_stack
     move.l d6, d5
     move.l d7, d6
     clr.l d7

@@ -30,7 +30,8 @@
 
 /* ── Async status word ──────────────────────────────────────────────────── */
 /* ROM4 base $FA0000 + offset $F008 = $FAF008.                               */
-/* Read the high byte of the word (= RP2040 low byte) with move.b $FAF008.  */
+/* The RP2040 stores the status in the high byte of this bus word, so a      */
+/* byte read at even address $FAF008 sees the status value directly.         */
 #define MDJS_STATUS_ADDR ((volatile unsigned char *)0xFAF008L)
 
 /* Status values (must match MDJS_STATUS_* in js_worker.h) */
@@ -50,6 +51,9 @@
 
 /* ── Maximum function name length (including NUL terminator) ────────────── */
 #define JS_CALL_FUNC_NAME_MAX 64
+
+/* ── Maximum call argument JSON length (including NUL terminator) ───────── */
+#define JS_CALL_ARGS_MAX 2032
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 

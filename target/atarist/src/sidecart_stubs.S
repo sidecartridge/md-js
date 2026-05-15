@@ -238,6 +238,8 @@ send_sync_write_command_to_sidecart:
 
     | Stream buffer bytes from a4, two at a time
     | d5 = byte count, d6 = running checksum accumulator (carry the old d7 in)
+    tst.l   d6
+    beq     .Lbuf_done
     move.l  d6,d5               | d5 = byte count
     move.l  d7,d6               | d6 = checksum so far
     clr.l   d7

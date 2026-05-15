@@ -51,8 +51,11 @@ static unsigned short build_call_payload(const char *func, const char *args_json
         fn_len = JS_CALL_FUNC_NAME_MAX - 1;
     }
 
-    /* Keep the write body within JS_UPLOAD_CHUNK_MAX (send_sync_write adds 16 bytes). */
-    max_args_len = JS_UPLOAD_CHUNK_MAX - (fn_len + 2);
+    /* Keep the write body within both the transport and RP-side args buffer. */
+    max_args_len = JS_CALL_ARGS_MAX - 1;
+    if (max_args_len > JS_UPLOAD_CHUNK_MAX - (fn_len + 2)) {
+        max_args_len = JS_UPLOAD_CHUNK_MAX - (fn_len + 2);
+    }
     if (max_args_len < 0) {
         max_args_len = 0;
     }
@@ -94,8 +97,8 @@ static void read_result(char *buf, int buf_size)
 
 int mdjs_ping(void)
 {
-    /* CMD_JS_PING: payload = random token (4 bytes). D1=4, D3=D4=0. */
-    return call_send_sync(CMD_JS_PING, 4, 0L, 0L);
+    /* send_sync adds the 4-byte random token internally. */
+    return call_send_sync(CMD_JS_PING, 0, 0L, 0L);
 }
 
 int mdjs_upload(const char *js_source)
@@ -151,7 +154,7 @@ int mdjs_call(const char *func, const char *args_json,
 
 int mdjs_reset(void)
 {
-    return call_send_sync(CMD_JS_RESET, 4, 0L, 0L);
+    return call_send_sync(CMD_JS_RESET, 0, 0L, 0L);
 }
 
 int mdjs_call_async(const char *func, const char *args_json)
@@ -186,7 +189,7 @@ unsigned char mdjs_status(void)
 
 int mdjs_poll(void)
 {
-    int err = call_send_sync(CMD_JS_POLL, 4, 0L, 0L);
+    int err = call_send_sync(CMD_JS_POLL, 0, 0L, 0L);
     if (err != 0) return err;
     return (int)mdjs_status();
 }

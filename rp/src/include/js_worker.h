@@ -12,7 +12,9 @@
  * ROM-in-RAM layout (128 KB total at __rom_in_ram_start__):
  *   0x0000–0xEFFF  ROM bank data (ROM4 / ROM3 emulation)
  *   0xF000–0xF007  Random token + seed
- *   0xF008–0xF0FF  Reserved/shared words
+ *   0xF008–0xF009  Async status word
+ *   0xF00A–0xF00B  Worker-ready word
+ *   0xF00C–0xF0FF  Reserved/shared words
  *   0xF100–0xF8FF  JS result buffer     (2 KB) — MD/JS
  *   0xF900–0xFFFF  Reserved
  */
@@ -36,8 +38,8 @@
 
 /* ── Async status word (readable by ST at ROM4_ADDR + JS_STATUS_OFFSET) ── */
 /* ROM4 base = $FA0000; JS_STATUS_OFFSET = 0xF008 → ST address $FAF008.    */
-/* RP2040 writes status in the low byte of a uint16_t. The ST reads the     */
-/* high byte of the bus word at $FAF008, which maps to the ARM low byte.    */
+/* RP2040 stores the status in the high byte of the bus word so an ST byte   */
+/* read at even address $FAF008 sees the status value directly.              */
 #define JS_STATUS_OFFSET    0xF008
 
 /* Status values — shared between RP2040 (js_worker.h) and ST (mdjs.h). */
@@ -52,19 +54,22 @@
 #define JS_RESULT_MAX_SIZE 2048
 
 /* ── Upload chunking ────────────────────────────────────────────────────── */
-/* Payload layout: token(4) + chunk_index(2) + total_chunks(2) +            */
-/*                 chunk_size(2) + js_bytes(N)                               */
-#define JS_UPLOAD_HDR_SIZE  10
+/* send_sync_write always sends token(4) + d3/d4/d5 longwords(12) before    */
+/* streaming buffer bytes. MD/JS uses the low word of d3/d4/d5 for          */
+/* chunk_index, total_chunks, and chunk_size.                               */
+#define JS_WRITE_HDR_SIZE   16
+#define JS_UPLOAD_HDR_SIZE  JS_WRITE_HDR_SIZE
 #define JS_UPLOAD_CHUNK_MAX (MAX_PROTOCOL_PAYLOAD_SIZE - JS_UPLOAD_HDR_SIZE)
 
 /* Maximum total assembled JS (8 chunks * max bytes per chunk) */
 #define JS_SOURCE_MAX (JS_UPLOAD_CHUNK_MAX * 8)
 
 /* ── CALL payload layout ────────────────────────────────────────────────── */
-/* token(4) + func_name(NUL-terminated, max 64 bytes) + args_json(rest)     */
+/* token(4) + d3/d4/d5(12) + func_name(NUL-terminated) + args_json(NUL).    */
 #define JS_CALL_FUNC_NAME_MAX 64
+#define JS_CALL_HDR_SIZE JS_WRITE_HDR_SIZE
 #define JS_CALL_ARGS_MAX \
-  (MAX_PROTOCOL_PAYLOAD_SIZE - 4 - JS_CALL_FUNC_NAME_MAX)
+  (MAX_PROTOCOL_PAYLOAD_SIZE - JS_CALL_HDR_SIZE - JS_CALL_FUNC_NAME_MAX)
 
 /* ── Inter-core FIFO message tags ───────────────────────────────────────── */
 /* Upper 8 bits of the 32-bit FIFO word carry the message type.             */
