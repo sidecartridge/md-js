@@ -156,3 +156,105 @@ Offset    ST address    Purpose
 | `stcmd` image not found                         | STCMD_IMAGE_TAG mismatch                | Check `stcmd` version vs app version                                                 |
 | Vasm warnings about overflow / trailing garbage | Version strings passed as `-D` macros   | Harmless, ignore                                                                     |
 | ST shows "not detected"                         | PING command timed out                  | Check UF2 is flashed; check UART for `MD/JS ready`                                   |
+
+## Bus protocol byte-order quirk (IMPORTANT)
+
+The cartridge protocol stores transmitted bytes in **byte-pair-swapped** order relative to what the m68k sent. This is a consequence of the PIO/DMA path:
+
+- m68k transmits a 16-bit word with the **high byte at the lower address** (big-endian).
+- PIO captures the 16-bit value the m68k put on the address bus.
+- `store_payload_16_asm` does `strh` to the protocol buffer — ARM little-endian writes **low byte at the lower address**.
+- Net effect: every adjacent byte pair appears swapped when read sequentially as a byte stream.
+
+**Where this matters:**
+- **UPLOAD body** (`core1_handle_upload`): source bytes must be un-swapped before `jerry_parse` sees them. Done in [js_worker.c](rp/src/js_worker.c) via `COPY_AND_CHANGE_ENDIANESS_BLOCK16(data, s_msg.js_source + ..., even_size)` in the CMD_JS_UPLOAD handler.
+- **Result buffer flush** (`core1_flush_result`): result bytes are pre-swapped on write so the ST sees big-endian byte order through `move.b` / `move.w`. **Always writes the full 2048 bytes** (with NUL-padded source) so stale tails from previous longer results don't bleed through.
+- **Token / longword fields**: NOT affected — `TPROTO_GET_RANDOM_TOKEN` swaps the two 16-bit halves internally; `TPROTO_GET_PAYLOAD_PARAM32` reads two adjacent words as (low, high) which compensates.
+- **CALL func_name / args_json**: currently NOT swapped in `js_parse_call_payload` because attempts to add the swap repeatedly hung the firmware in cold-start scenarios. The CALL path works empirically — investigate before re-adding any swap there. (Theory: payload alignment, or the stale TransmissionProtocol buffer interacts with the swap helper differently than the inline UPLOAD swap.)
+- **CMD_JS_POLL**: writes a short status JSON to the result buffer but does NOT zero-pad — bytes beyond the JSON length may contain stale data from previous flushes. Users who read the buffer after `mdjs_poll()` will see truncated stale tails. `mdjs_status()` reads `$FAF008` directly and is unaffected.
+
+**Single-character ASCII results:** the byte-swap produces `[0x00, digit]` at offsets 0..1 of `s_result_mem`. The PIO outputs uint16 `0x_digit_00` to the bus. m68k reads byte at even address (UDS) = high byte of word = the digit. So `"7\0"` reads back as `'7'` correctly via byte reads.
+
+## ST-side C ABI quirks
+
+`m68k-atari-mint-gcc` uses **32-bit `int`** by default (no `-mshort`). Stack args are pushed in 4-byte slots; for small int values, the **low 16 bits sit at offset +2** of the 4-byte slot (big-endian). Stub wrappers in [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S) must read full longwords for `int` args, not 16-bit words:
+
+```asm
+; CORRECT — reads full 32-bit int, callee uses d0.w
+move.l 48(sp),d0
+
+; WRONG — reads the HIGH 16 bits of a 32-bit int, always 0 for small values
+move.w 48(sp),d0
+```
+
+Any new C-callable assembly wrapper must follow the same pattern. Symptom of getting this wrong: every command is sent as 0x0000 and the RP logs `js_worker_loop: ignoring command 0x0000`.
+
+## JerryScript memory model
+
+Two changes that are easy to undo and re-break:
+
+1. **Static context buffer** ([jerry_port.c](rp/src/jerry_port.c)) — JerryScript's context + heap lives in a static BSS buffer, NOT malloc. Calling `malloc()` from Core 1 is not safe on pico-sdk (newlib's lazy init races with Core 0). Buffer size: 48 KB heap + 8 KB context headroom. The 8 KB headroom is generous; `sizeof(jerry_context_t)` can grow with build flags, and a NULL `current_context_p` from a too-small buffer causes a silent fault in `jerry_init()`.
+
+2. **`__StackLimit` capped at end of RAM** ([memmap_rp.ld](rp/src/memmap_rp.ld)) — originally `ORIGIN(RAM) + LENGTH(RAM) + LENGTH(ROM_IN_RAM)`, which let `_sbrk` grow the libc heap into ROM_IN_RAM (the bus-shared cartridge emulation buffer). Now `ORIGIN(RAM) + LENGTH(RAM)` only. If you raise this back, malloc can corrupt the ST-visible memory.
+
+## Core 1 stdio is dangerous
+
+Newlib's `printf` / `fputs` are **NOT dual-core safe** on pico-sdk. Concurrent stdio from both cores corrupts buffers and can deadlock Core 1 inside libc. Symptoms: garbled interleaved UART output, then Core 1 hangs.
+
+**Rules:**
+- Core 1 must NEVER call `DPRINTF` / `printf` / `puts` / `fprintf`.
+- For Core 1 diagnostics, use the shared-state pattern in [js_worker.c](rp/src/js_worker.c): Core 1 writes a phase byte (`s_core1_phase`) or stages a NUL-terminated string in `s_core1_diag_msg` + bumps `s_core1_diag_seq`. Core 0 polls these in `js_worker_loop` and prints transitions.
+- `jerry_port_log` is the one allowed exception, but it's wired to write to a stderr that won't actually emit (JerryScript only logs on errors during script parsing, and we control the script source).
+
+## Debug diagnostics still in tree
+
+The following are intentionally kept enabled for debug builds; remove for release if noise becomes a problem:
+
+- `js_dispatch: cmd=0xNNNN payload=N` — every protocol command dispatched
+- `Core 1 phase -> N` — Core 1 init/loop state machine transitions
+- `Core 1 diag -> N` — UPLOAD parse/run outcome, CALL FUNC_FOUND/MISS, call result OK/ERR
+- `Core 1 msg: ...` — upload source hex + ASCII view; call result string
+
+Constants: `C1_PHASE_*` in [js_worker.c](rp/src/js_worker.c) define the diag byte values.
+
+## Demo applications — TWO separate implementations
+
+Confusing trap: there are two demos and they share neither source nor build path.
+
+1. **Cartridge-embedded demo** ([target/atarist/src/main.s](target/atarist/src/main.s) — labels `mdjsdemo_cart_run` / `mdjsdemo_ram_entry`) — 68k assembly. Runs when the user double-clicks the cartridge `c:` drive icon. Self-contained: includes its own AES wrappers, random-number generation (XBIOS Supexec reading `$4BA` 200 Hz counter), and call payload builder. **This is what we used for protocol debugging.**
+
+2. **Standalone `MDJSDEMO.PRG`** ([target/atarist/src/demo_gem.c](target/atarist/src/demo_gem.c) + [mdjs.c](target/atarist/src/mdjs.c) + [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S)) — C-based GEM program, also copied to `dist/`. For users to drop in their AUTO folder or run from desktop.
+
+**If you change protocol behavior, you must update BOTH.** The cartridge demo uses the inline assembly path; the standalone PRG uses the C `mdjs.c` + stubs path. They send the same commands but via different code.
+
+## Known issue: first-call cold-bus flake
+
+After a fresh RP boot, the FIRST round-trip `mdjs_call()` from the ST may return a result that the ST reads as zeros (alert shows "did not return"). Subsequent calls work consistently. Reproduces with both the cartridge demo and the standalone PRG. Investigated extensively without resolution; suspect a cartridge bus settle path or TOS-side cartridge access caching that we can't see from the RP side.
+
+**Workarounds attempted that did NOT help:**
+- Memory barriers (`__dmb()`) before and after the flush
+- Full 2048-byte zero-padded flush (overwrites all stale tail data)
+- Flush-sequence counter spin-wait before unblocking the ST
+- Warm-up CALL of a dummy function before the real call
+- Warm-up reads of `$FAF100` on the ST side
+- Protocol parser reset at init
+- Stray-CALL drain window at init
+
+**Documented user workaround:** call `mdjs_ping()` once at app startup. The first real call won't always succeed cold, so apps that care should retry on empty results.
+
+## RP2040-side build quirks
+
+- `make debug` (top-level) builds with `DEBUG_MODE=1` → `_DEBUG=1` → enables UART stdio on GP0/GP1. USB CDC is intentionally disabled ([CMakeLists.txt:241](rp/src/CMakeLists.txt#L241)) — UART output requires a debug probe or USB-to-UART adapter. There is no `/dev/tty.usbmodem*` PTY from the RP itself, only from the debug probe's CDC bridge.
+- `make uart` attaches `screen` to the first matching serial device at 115200.
+- The build script auto-bumps `version.txt` patch number on every invocation. To suppress, set `SKIP_VERSION_BUMP=1`.
+
+## Where to look when something breaks
+
+| Symptom on ST                           | Where to look                                                                                              |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Boot message wrong / missing            | [main.s](target/atarist/src/main.s) `start_rom_code`, polls `$FAF00A` for magic `$4A`                      |
+| Demo always says "worker not detected"  | `mdjs_ping()` timing out — for standalone PRG, check [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S) parameter offsets (32-bit int!) |
+| `function 'X' not found` for valid name | Byte-swap issue on CALL path or `add` actually wasn't defined — check UART for `Core 1 diag` and `Core 1 msg` |
+| Garbled chars in result                 | `core1_flush_result` not pre-swapping; check `COPY_AND_CHANGE_ENDIANESS_BLOCK16` is called                 |
+| Bombs / crash on demo exit              | Stack-resident demo code returning to corrupt SR/USP — check `mdjsdemo_cart_run`                            |
+| `ignoring command 0x0000` in UART       | Either bus noise (harmless) or C ABI int-size bug in stubs (broken)                                        |

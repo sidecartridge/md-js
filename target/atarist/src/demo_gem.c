@@ -5,7 +5,7 @@
  * Demonstrates the MD/JS JavaScript Worker:
  *   1. Pings the worker to confirm it is available.
  *   2. Uploads a simple "add" function: function add(a,b){ return a+b; }
- *   3. Calls add(5, 7) and displays the result in a GEM alert dialog.
+ *   3. Calls add(a, b) with two random integers and shows the result.
  *
  * Build with m68k-atari-mint-gcc (or equivalent 68000 cross-compiler):
  *   m68k-atari-mint-gcc -m68000 -O2 -fomit-frame-pointer \
@@ -20,6 +20,9 @@
 /* GEM AES / VDI bindings — provided by MiNTLib or Pure C */
 #include <gem.h>
 
+/* osbind.h provides GEMDOS/XBIOS traps (Random, Supexec, etc.) as inlines. */
+#include <osbind.h>
+
 #include "mdjs.h"
 
 /* Maximum length of a form_alert string */
@@ -28,8 +31,10 @@
 int main(void) {
   int app_id;
   char alert_str[ALERT_BUF_SIZE];
+  char args_str[16];
   char result[64];
   int err;
+  int a, b;
 
   /* Initialise GEM application */
   app_id = appl_init();
@@ -54,9 +59,13 @@ int main(void) {
     return 0;
   }
 
-  /* ── 3. Call add(5, 7) ─────────────────────────────────────────── */
+  /* ── 3. Call add(a, b) with random a, b in 1..8 ───────────────── */
+  a = (int)(Random() & 7) + 1;
+  b = (int)(Random() & 7) + 1;
+  snprintf(args_str, sizeof(args_str), "[%d,%d]", a, b);
+
   memset(result, 0, sizeof(result));
-  err = mdjs_call("add", "[5,7]", result, (int)sizeof(result));
+  err = mdjs_call("add", args_str, result, (int)sizeof(result));
   if (err != 0) {
     form_alert(1, "[1][MD/JS call|failed.][OK]");
     appl_exit();
@@ -64,8 +73,8 @@ int main(void) {
   }
 
   /* ── 4. Show the result ────────────────────────────────────────── */
-  snprintf(alert_str, ALERT_BUF_SIZE, "[1][MD/JS Demo|add(5,7) = %s][OK]",
-           result);
+  snprintf(alert_str, ALERT_BUF_SIZE,
+           "[1][MD/JS Demo|add(%d,%d) = %s][OK]", a, b, result);
   form_alert(1, alert_str);
 
   appl_exit();

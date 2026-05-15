@@ -153,15 +153,21 @@ send_sync_command_to_sidecart:
     rts
 
 /* ── C ABI wrappers for mdjs.c (avoid fragile inline asm constraints) ────── */
-/* int mdjs_send_sync_command(int cmd, int payload_size, long d3, long d4) */
+/* int mdjs_send_sync_command(int cmd, int payload_size, long d3, long d4)
+ *
+ * m68k-atari-mint-gcc uses 32-bit ints by default. Each arg occupies 4 bytes
+ * on the stack; for 16-bit values the LOW 16 bits sit at offset +2 of the
+ * 4-byte slot (big-endian). Read full longwords and let callee use d0.w/d1.w.
+ */
     .globl _mdjs_send_sync_command
 _mdjs_send_sync_command:
-    /* Preserve callee-saved registers expected by the C ABI. */
+    /* Preserve callee-saved registers expected by the C ABI (11 regs = 44 bytes)
+     * + 4 bytes return address = 48 bytes to the first arg. */
     movem.l d2-d7/a2-a6,-(sp)
-    move.w  48(sp),d0
-    move.w  52(sp),d1
-    move.l  56(sp),d3
-    move.l  60(sp),d4
+    move.l  48(sp),d0           | cmd (low 16 bits used)
+    move.l  52(sp),d1           | payload_size (low 16 bits used)
+    move.l  56(sp),d3           | d3 (full longword)
+    move.l  60(sp),d4           | d4 (full longword)
     jsr     send_sync_command_to_sidecart
     movem.l (sp)+,d2-d7/a2-a6
     rts
@@ -333,20 +339,18 @@ send_sync_write_command_to_sidecart:
 
 /* int mdjs_send_sync_write_command(int cmd, const char *buf, int byte_count,
  *                                  int chunk_idx, int total_chunks,
- *                                  int chunk_size) */
+ *                                  int chunk_size)
+ *
+ * 32-bit ints — each int arg occupies a 4-byte slot; read full longwords. */
     .globl _mdjs_send_sync_write_command
 _mdjs_send_sync_write_command:
-    /* Preserve callee-saved registers expected by the C ABI. */
     movem.l d2-d7/a2-a6,-(sp)
-    move.w  48(sp),d0
-    move.l  52(sp),a4
-    move.w  56(sp),d6
-    moveq   #0,d3
-    move.w  60(sp),d3
-    moveq   #0,d4
-    move.w  64(sp),d4
-    moveq   #0,d5
-    move.w  68(sp),d5
+    move.l  48(sp),d0           | cmd (low 16 bits used)
+    move.l  52(sp),a4           | buf pointer (32-bit)
+    move.l  56(sp),d6           | byte_count (low 16 bits used)
+    move.l  60(sp),d3           | chunk_idx
+    move.l  64(sp),d4           | total_chunks
+    move.l  68(sp),d5           | chunk_size
     jsr     send_sync_write_command_to_sidecart
     movem.l (sp)+,d2-d7/a2-a6
     rts
