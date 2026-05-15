@@ -385,6 +385,11 @@ static void core1_flush_result(void) {
   *s_status_mem = MDJS_BUS_BYTE_WORD(s_msg.result_is_error
                                       ? MDJS_STATUS_ERROR
                                       : MDJS_STATUS_DONE);
+  /* Ensure all writes to ROM_IN_RAM are visible to the PIO/DMA bus master
+   * before Core 0 sees the FIFO DONE and writes the random token. Without
+   * this, the first-run demo can read zeros from the result buffer because
+   * Core 1's final word write hasn't propagated by the time the ST polls. */
+  __dmb();
   spin_unlock(s_spin_lock, save);
 }
 
@@ -473,29 +478,24 @@ static void __not_in_flash_func(js_write_busy_error)(void) {
 }
 
 /* Parse a CALL payload (func_name\0args_json\0) into s_msg under spin-lock. */
-/* Scratch buffer for byte-swapped CALL payload. Sized to comfortably hold
- * func_name + args_json. Function names are short (≤63 chars) and demo
- * args fit easily; full JS_CALL_ARGS_MAX is 2032 bytes but most callers
- * use a fraction. Keep this modest to limit BSS pressure. */
-#define JS_CALL_SWAP_BUF_SIZE 256
-
 static bool js_parse_call_payload(const uint8_t *payload, size_t payload_size) {
   if (payload_size == 0u) {
     return false;
   }
 
-  /* The protocol parser stores each 16-bit bus word little-endian, but the
-   * m68k transmitted bytes big-endian. Un-swap pairs into a scratch buffer
-   * so the NUL scans operate on the original byte order. */
-  static uint8_t swapped[JS_CALL_SWAP_BUF_SIZE];
-  if (payload_size > sizeof(swapped)) {
-    return false;
+  /* Un-swap protocol bytes using a manual byte-by-byte loop to avoid the
+   * uint16_t macro path that has been observed to wedge on cold-start
+   * garbage. Bounded to 256 bytes — function names + small args fit easily. */
+  static uint8_t swapped[256];
+  size_t copy_len = payload_size < sizeof(swapped) ? payload_size : sizeof(swapped);
+  size_t even_len = copy_len & ~(size_t)1u;
+  for (size_t i = 0; i < even_len; i += 2) {
+    swapped[i] = payload[i + 1];
+    swapped[i + 1] = payload[i];
   }
-  size_t even_size = payload_size & ~(size_t)1u;
-  COPY_AND_CHANGE_ENDIANESS_BLOCK16(payload, swapped, even_size);
 
   const char *func_name = (const char *)swapped;
-  const char *fn_end = memchr(func_name, '\0', even_size);
+  const char *fn_end = memchr(func_name, '\0', even_len);
   if ((fn_end == NULL) || (fn_end == func_name)) {
     return false;
   }
@@ -506,7 +506,7 @@ static bool js_parse_call_payload(const uint8_t *payload, size_t payload_size) {
   }
 
   const char *args_json = fn_end + 1;
-  size_t args_size = even_size - fn_len - 1u;
+  size_t args_size = even_len - fn_len - 1u;
   const char *args_end = memchr(args_json, '\0', args_size);
   if (args_end == NULL) {
     return false;
@@ -774,18 +774,6 @@ void js_worker_init(void) {
   srand((unsigned int)time(NULL));
   uint32_t seed = rand();
   TPROTO_SET_RANDOM_TOKEN(s_token_seed_addr, seed);
-
-  /* Debug sentinel: write a short readable string to the result buffer so the
-   * demo can distinguish "result-buffer plumbing is broken" (sees nothing)
-   * from "CALL path is broken" (sees "BOOT" instead of the call result). */
-  {
-    static const char boot_sentinel[] = "BOOT";
-    /* Round to even byte count for the 16-bit swap macro. */
-    size_t boot_len = (sizeof(boot_sentinel) + 1u) & ~1u;
-    COPY_AND_CHANGE_ENDIANESS_BLOCK16(boot_sentinel,
-                                      (void *)s_result_mem,
-                                      boot_len);
-  }
 
   DPRINTF("js_worker_init: launching Core 1\n");
   multicore_launch_core1(core1_entry);
