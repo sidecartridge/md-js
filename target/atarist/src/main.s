@@ -239,17 +239,29 @@ mdjsdemo_ram_entry:
 	bra .mdjsdemo_exit_aes
 .mdjsdemo_upload_ok:
 
-	lea mdjsdemo_call_payload(pc), a4
+	; Build a fresh CALL payload "add\0[a,b]\0" with random a, b in 1..8.
+	; Also fills the alert prefix "[1][MD/JS Demo|add(a,b) = ".
+	; Returns the body length in A3.
+	bsr mdjsdemo_build_call_payload
+	move.l a3, -(sp)				; preserve body length across send_sync_write
+	move.w #CMD_RETRIES_COUNT, d7
+.mdjsdemo_call_retry:
+	lea mdjsdemo_call_buf(pc), a4
 	moveq #0, d3
 	moveq #1, d4
-	move.l #MDJS_CALL_PAYLOAD_LEN, d5
-	send_write_sync CMD_JS_CALL, MDJS_CALL_PAYLOAD_LEN
+	move.l (sp), d5					; reload body length
+	move.l (sp), d6
+	move.w #CMD_JS_CALL, d0
+	bsr send_sync_write_command_to_sidecart
 	tst.w d0
-	beq .mdjsdemo_call_ok
+	beq.s .mdjsdemo_call_ok
+	dbf d7, .mdjsdemo_call_retry
+	addq.l #4, sp					; drop preserved length
 	lea mdjsdemo_alert_call_failed(pc), a0
 	bsr mdjsdemo_form_alert
 	bra .mdjsdemo_exit_aes
 .mdjsdemo_call_ok:
+	addq.l #4, sp					; drop preserved length
 
 	bsr mdjsdemo_build_success_alert
 	lea mdjsdemo_alert_buffer(pc), a0
@@ -324,7 +336,7 @@ mdjsdemo_form_alert:
 
 mdjsdemo_build_success_alert:
 	lea mdjsdemo_alert_buffer(pc), a0
-	lea mdjsdemo_alert_prefix(pc), a1
+	lea mdjsdemo_alert_prefix_buf(pc), a1
 	bsr mdjsdemo_append_cstr
 	bsr mdjsdemo_append_result
 	tst.w d6
@@ -396,6 +408,94 @@ mdjsdemo_append_result:
 .append_result_done:
 	rts
 
+; Build a fresh CALL payload "add\0[a,b]\0" with random a, b in 1..8.
+; Also rewrites the alert prefix to "[1][MD/JS Demo|add(a,b) = ".
+; Output:
+;   a3 = body length in bytes (incl. NULs after func name and args)
+;   mdjsdemo_call_buf filled with payload
+;   mdjsdemo_alert_prefix_buf filled with prefix
+; Clobbers: d0-d2, a0-a2
+; Supervisor-mode helper: read the 32-bit 200 Hz counter at $4BA into d0.
+; Called via XBIOS Supexec. Must end with rts.
+mdjsdemo_read_hz200:
+	move.l $4BA.w, d0
+	rts
+
+mdjsdemo_build_call_payload:
+	; Read the 200 Hz system counter at $4BA — increments 200 times/sec
+	; from boot, so each run sees a different value. Need Super() to read
+	; it safely; use Supexec to run a tiny reader in supervisor mode.
+	lea mdjsdemo_read_hz200(pc), a0
+	move.l a0, -(sp)
+	move.w #38, -(sp)			; XBIOS Supexec (#38)
+	trap #14
+	addq.l #6, sp
+	; d0 now holds the 32-bit _hz_200 value (set by mdjsdemo_read_hz200)
+	move.l d0, d3				; save full counter
+
+	; a = low 3 bits + 1 → 1..8
+	move.l d3, d0
+	andi.l #7, d0
+	addq.l #1, d0
+	move.b d0, d1				; d1 = a (1..8)
+
+	; b = next 3 bits (rotated) + 1 → 1..8, ensure decorrelated from a
+	move.l d3, d0
+	lsr.l #3, d0
+	andi.l #7, d0
+	addq.l #1, d0
+	move.b d0, d2				; d2 = b (1..8)
+
+	; Build call buffer: "add\0[<a>,<b>]\0"
+	lea mdjsdemo_call_buf(pc), a0
+	move.l a0, a1				; remember start
+	move.b #'a', (a0)+
+	move.b #'d', (a0)+
+	move.b #'d', (a0)+
+	clr.b (a0)+
+	move.b #'[', (a0)+
+	addi.b #'0', d1
+	move.b d1, (a0)+
+	move.b #',', (a0)+
+	addi.b #'0', d2
+	move.b d2, (a0)+
+	move.b #']', (a0)+
+	clr.b (a0)+
+	move.l a0, a3
+	sub.l a1, a3				; a3 = body length
+
+	; Build alert prefix: "[1][MD/JS Demo|add(a,b) = "
+	; d1, d2 already hold the digit characters from the payload build above.
+	lea mdjsdemo_alert_prefix_buf(pc), a0
+	move.b #'[', (a0)+
+	move.b #'1', (a0)+
+	move.b #']', (a0)+
+	move.b #'[', (a0)+
+	move.b #'M', (a0)+
+	move.b #'D', (a0)+
+	move.b #'/', (a0)+
+	move.b #'J', (a0)+
+	move.b #'S', (a0)+
+	move.b #' ', (a0)+
+	move.b #'D', (a0)+
+	move.b #'e', (a0)+
+	move.b #'m', (a0)+
+	move.b #'o', (a0)+
+	move.b #'|', (a0)+
+	move.b #'a', (a0)+
+	move.b #'d', (a0)+
+	move.b #'d', (a0)+
+	move.b #'(', (a0)+
+	move.b d1, (a0)+
+	move.b #',', (a0)+
+	move.b d2, (a0)+
+	move.b #')', (a0)+
+	move.b #' ', (a0)+
+	move.b #'=', (a0)+
+	move.b #' ', (a0)+
+	clr.b (a0)
+	rts
+
 msg_ready:
 	dc.b "MD/JS: JavaScript Worker is ready",$d,$a,0
 	even
@@ -431,14 +531,6 @@ mdjsdemo_upload_source_end:
 	even
 MDJS_UPLOAD_SOURCE_LEN	equ (mdjsdemo_upload_source_end - mdjsdemo_upload_source)
 
-mdjsdemo_call_payload:
-	dc.b "add",0,"[5,7]",0
-mdjsdemo_call_payload_end:
-	even
-MDJS_CALL_PAYLOAD_LEN	equ (mdjsdemo_call_payload_end - mdjsdemo_call_payload)
-
-mdjsdemo_alert_prefix:
-	dc.b "[1][MD/JS Demo|add(5,7) = ",0
 mdjsdemo_alert_suffix:
 	dc.b "][OK]",0
 
@@ -461,6 +553,16 @@ mdjsdemo_noaes_msg:
 
 mdjsdemo_alert_buffer:
 	ds.b 128
+	even
+
+; Writable call payload buffer: "add\0[a,b]\0" — 10 bytes is enough, but pad for safety.
+mdjsdemo_call_buf:
+	ds.b 16
+	even
+
+; Writable alert prefix: "[1][MD/JS Demo|add(a,b) = "
+mdjsdemo_alert_prefix_buf:
+	ds.b 32
 	even
 
 ; Shared functions included at the end of the file

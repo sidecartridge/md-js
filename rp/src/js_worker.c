@@ -373,6 +373,12 @@ static void core1_handle_reset(void) {
  * the Atari ST sees the bytes in big-endian order when reading through the
  * cartridge ROM address space.
  */
+/* Bumped by Core 1 at the end of every result flush. Core 0 reads it
+ * before dispatching a Core-1 op and waits for it to change before
+ * unblocking the ST — guards against a flush that happens but isn't yet
+ * visible at the bus when the token is written. */
+static volatile uint32_t s_flush_seq = 0;
+
 static void core1_flush_result(void) {
   uint32_t save = spin_lock_blocking(s_spin_lock);
   size_t len = strnlen(s_msg.result_json, JS_RESULT_MAX_SIZE - 1) + 1;
@@ -385,11 +391,8 @@ static void core1_flush_result(void) {
   *s_status_mem = MDJS_BUS_BYTE_WORD(s_msg.result_is_error
                                       ? MDJS_STATUS_ERROR
                                       : MDJS_STATUS_DONE);
-  /* Ensure all writes to ROM_IN_RAM are visible to the PIO/DMA bus master
-   * before Core 0 sees the FIFO DONE and writes the random token. Without
-   * this, the first-run demo can read zeros from the result buffer because
-   * Core 1's final word write hasn't propagated by the time the ST polls. */
   __dmb();
+  s_flush_seq++;
   spin_unlock(s_spin_lock, save);
 }
 
@@ -410,8 +413,13 @@ static void js_send_response(uint32_t random_token) {
 /**
  * Wait for Core 1 to finish, with timeout recovery.
  * Returns the FIFO message tag, or FIFO_MSG_ERROR on timeout.
+ *
+ * pre_seq is the value of s_flush_seq captured by the caller BEFORE pushing
+ * a work request to Core 1. After the FIFO reply arrives, this function
+ * waits briefly for s_flush_seq to advance past pre_seq — guarding against
+ * a result flush whose final bus writes haven't propagated yet.
  */
-static uint8_t js_wait_for_core1(void) {
+static uint8_t js_wait_for_core1(uint32_t pre_seq) {
   uint32_t resp = 0;
   bool     ok   = multicore_fifo_pop_timeout_us(JS_CALL_TIMEOUT_US, &resp);
   if (!ok) {
@@ -427,6 +435,15 @@ static uint8_t js_wait_for_core1(void) {
     multicore_launch_core1(core1_entry);
     return FIFO_MSG_ERROR;
   }
+
+  /* Belt-and-braces: spin briefly until Core 1's flush counter has advanced
+   * past the pre-call snapshot. Bounded to ~1 ms total (10000 iterations of
+   * ~100 ns each on a 125 MHz Cortex-M0+). */
+  for (int i = 0; i < 10000; i++) {
+    if (s_flush_seq != pre_seq) break;
+    __asm volatile("nop");
+  }
+  __dmb();
   return (uint8_t)((resp & FIFO_TAG_MASK) >> FIFO_TAG_SHIFT);
 }
 
@@ -568,8 +585,9 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
 
     /* ── CMD_JS_PING ──────────────────────────────────────────────────── */
     case CMD_JS_PING: {
+      uint32_t pre_seq = s_flush_seq;
       multicore_fifo_push_blocking((uint32_t)FIFO_MSG_PING << FIFO_TAG_SHIFT);
-      js_wait_for_core1();
+      js_wait_for_core1(pre_seq);
       js_send_response(random_token);
       break;
     }
@@ -642,9 +660,10 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
 
       if (last_chunk) {
         /* All chunks received — tell Core 1 to eval */
+        uint32_t pre_seq = s_flush_seq;
         multicore_fifo_push_blocking(
             (uint32_t)FIFO_MSG_UPLOAD << FIFO_TAG_SHIFT);
-        js_wait_for_core1();
+        js_wait_for_core1(pre_seq);
       } else {
         /* Intermediate chunk ACK — write a partial-OK into result memory */
         const char ack[] = "{\"ok\":true,\"partial\":true}";
@@ -680,16 +699,18 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
         break;
       }
 
+      uint32_t pre_seq = s_flush_seq;
       multicore_fifo_push_blocking((uint32_t)FIFO_MSG_CALL << FIFO_TAG_SHIFT);
-      js_wait_for_core1();
+      js_wait_for_core1(pre_seq);
       js_send_response(random_token);
       break;
     }
 
     /* ── CMD_JS_RESET ─────────────────────────────────────────────────── */
     case CMD_JS_RESET: {
+      uint32_t pre_seq = s_flush_seq;
       multicore_fifo_push_blocking((uint32_t)FIFO_MSG_RESET << FIFO_TAG_SHIFT);
-      js_wait_for_core1();
+      js_wait_for_core1(pre_seq);
       js_send_response(random_token);
       break;
     }
