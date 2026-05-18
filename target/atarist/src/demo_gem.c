@@ -9,7 +9,7 @@
  *
  * Build with m68k-atari-mint-gcc (or equivalent 68000 cross-compiler):
  *   m68k-atari-mint-gcc -m68000 -O2 -fomit-frame-pointer \
- *       mdjs.c demo_gem.c -lgem -o MDJSDEMO.PRG
+ *       mdjs.c demo_gem.c -lgem -o MDJSCODE.PRG
  *
  * This is a standalone demo — run it from GEM desktop or place it in AUTO/.
  */

@@ -43,7 +43,7 @@ PICO_TOOLCHAIN_PATH=/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin \
 # Output in dist/:
 #   <UUID>-v<version>.uf2   ← flash this to the SidecarTridge
 #   <UUID>.json             ← app descriptor (md5 auto-filled)
-#   MDJSDEMO.PRG            ← GEM demo for the ST
+#   MDJSCODE.PRG            ← standalone GEM demo for the ST
 ```
 
 The build script: copies `version.txt` → builds ST target (vasm + m68k-atari-mint-gcc) → generates `target_firmware.h` → builds RP2040 target (CMake + ARM GCC) → assembles dist/.
@@ -223,7 +223,7 @@ Confusing trap: there are two demos and they share neither source nor build path
 
 1. **Cartridge-embedded demo** ([target/atarist/src/main.s](target/atarist/src/main.s) — labels `mdjsdemo_cart_run` / `mdjsdemo_ram_entry`) — 68k assembly. Runs when the user double-clicks the cartridge `c:` drive icon. Self-contained: includes its own AES wrappers, random-number generation (XBIOS Supexec reading `$4BA` 200 Hz counter), and call payload builder. **This is what we used for protocol debugging.**
 
-2. **Standalone `MDJSDEMO.PRG`** ([target/atarist/src/demo_gem.c](target/atarist/src/demo_gem.c) + [mdjs.c](target/atarist/src/mdjs.c) + [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S)) — C-based GEM program, also copied to `dist/`. For users to drop in their AUTO folder or run from desktop.
+2. **Standalone `MDJSCODE.PRG`** ([target/atarist/src/demo_gem.c](target/atarist/src/demo_gem.c) + [mdjs.c](target/atarist/src/mdjs.c) + [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S)) — C-based GEM program, copied to `dist/`. For users to drop in their AUTO folder or run from desktop. Distinct filename from the cartridge-embedded `MDJSDEMO.PRG` so the two don't get confused.
 
 **If you change protocol behavior, you must update BOTH.** The cartridge demo uses the inline assembly path; the standalone PRG uses the C `mdjs.c` + stubs path. They send the same commands but via different code.
 

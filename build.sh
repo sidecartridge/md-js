@@ -43,12 +43,12 @@ cd target/atarist
 cd ../..
 echo "Done building target project"
 
-# Copy the GEM demo app to dist/ if it was built
-if [ -f "target/atarist/dist/MDJSDEMO.PRG" ]; then
-    cp target/atarist/dist/MDJSDEMO.PRG dist/MDJSDEMO.PRG
-    echo "Copied MDJSDEMO.PRG to dist/"
+# Copy the standalone GEM app to dist/ if it was built
+if [ -f "target/atarist/dist/MDJSCODE.PRG" ]; then
+    cp target/atarist/dist/MDJSCODE.PRG dist/MDJSCODE.PRG
+    echo "Copied MDJSCODE.PRG to dist/"
 else
-    echo "Note: MDJSDEMO.PRG not found (C cross-compiler may not be available). Skipping."
+    echo "Note: MDJSCODE.PRG not found (C cross-compiler may not be available). Skipping."
 fi
 
 # Build the rp project in the RP architecture

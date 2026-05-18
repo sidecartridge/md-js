@@ -33,7 +33,7 @@ SOURCES_DIR = ./src
 BUILD_DIR = ./build
 DIST_DIR = ./dist
 BIN = BOOT.BIN
-DEMO_BIN = MDJSDEMO.PRG
+DEMO_BIN = MDJSCODE.PRG
 
 # VASM PARAMETERS
 # _DEBUG: 1 to enable debug, 0 to disable them
