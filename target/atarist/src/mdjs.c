@@ -93,6 +93,25 @@ static void read_result(char *buf, int buf_size)
     dst[i] = '\0';
 }
 
+/* ── Inter-command settle delay ───────────────────────────────────────────── */
+/* Back-to-back protocol commands can race the cartridge bus settle path on
+ * a freshly-booted SidecarTridge, causing one or more commands to be lost
+ * by the RP's protocol parser. A short delay between commands eliminates
+ * the race. ~6ms on an 8 MHz 68000 — imperceptible to humans, with margin.
+ *
+ * The settle is invoked at the start of each command-emitting function
+ * except mdjs_ping (typically the first call after fresh boot, no preceding
+ * command to race with) and mdjs_poll (called rapidly in a polling loop;
+ * the prior mdjs_call_async will have already settled).
+ *
+ * Tuning history: 50ms reliable → 25ms reliable → 12ms reliable → 6ms
+ * reliable. Stopped here as a sensible floor with safety margin. */
+static void mdjs_settle(void)
+{
+    volatile long i;
+    for (i = 0; i < 25000L; i++) { }
+}
+
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
 int mdjs_ping(void)
@@ -106,6 +125,8 @@ int mdjs_upload(const char *js_source)
     if (!js_source) {
         return 1;
     }
+
+    mdjs_settle();
 
     int total        = (int)strlen(js_source);
     int offset       = 0;
@@ -141,6 +162,8 @@ int mdjs_call(const char *func, const char *args_json,
         return 1;
     }
 
+    mdjs_settle();
+
     char payload[JS_UPLOAD_CHUNK_MAX];
     unsigned short body_len = build_call_payload(func, args_json, payload);
     int err = call_send_sync_write(CMD_JS_CALL, payload, body_len, 0, 1, body_len);
@@ -154,6 +177,7 @@ int mdjs_call(const char *func, const char *args_json,
 
 int mdjs_reset(void)
 {
+    mdjs_settle();
     return call_send_sync(CMD_JS_RESET, 0, 0L, 0L);
 }
 
@@ -166,6 +190,8 @@ int mdjs_call_async(const char *func, const char *args_json)
     /* Bail immediately if a previous async call is still running */
     if (mdjs_status() == MDJS_STATUS_BUSY)
         return MDJS_STATUS_BUSY;
+
+    mdjs_settle();
 
     char payload[JS_UPLOAD_CHUNK_MAX];
     unsigned short body_len = build_call_payload(func, args_json, payload);

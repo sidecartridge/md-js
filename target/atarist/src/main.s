@@ -227,6 +227,11 @@ mdjsdemo_ram_entry:
 	bra .mdjsdemo_exit_aes
 .mdjsdemo_ping_ok:
 
+	; Settle delay before UPLOAD — back-to-back protocol commands can race
+	; the cartridge bus on a freshly-booted SidecarTridge and lose a frame.
+	; Three VBL waits (~50ms on PAL, 50ms on NTSC) keeps the gap safe.
+	bsr mdjsdemo_settle
+
 	lea mdjsdemo_upload_source(pc), a4
 	moveq #0, d3
 	moveq #1, d4
@@ -238,6 +243,9 @@ mdjsdemo_ram_entry:
 	bsr mdjsdemo_form_alert
 	bra .mdjsdemo_exit_aes
 .mdjsdemo_upload_ok:
+
+	; Settle delay before CALL — see comment above.
+	bsr mdjsdemo_settle
 
 	; Build a fresh CALL payload "add\0[a,b]\0" with random a, b in 1..8.
 	; Also fills the alert prefix "[1][MD/JS Demo|add(a,b) = ".
@@ -362,6 +370,17 @@ mdjsdemo_append_cstr:
 	move.b d0, (a0)+
 	bra .append_cstr_loop
 .append_cstr_done:
+	rts
+
+; Inter-command settle delay: busy-loop ~6ms on 8 MHz 68000. See
+; mdjs_settle() in mdjs.c for rationale and tuning history.
+mdjsdemo_settle:
+	move.l d7, -(sp)
+	move.l #12500, d7
+.settle_loop:
+	subq.l #1, d7
+	bne.s .settle_loop
+	move.l (sp)+, d7
 	rts
 
 ; Append unswapped result bytes from MDJS_RESULT_ADDR to dst (a0).

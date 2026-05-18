@@ -227,20 +227,46 @@ Confusing trap: there are two demos and they share neither source nor build path
 
 **If you change protocol behavior, you must update BOTH.** The cartridge demo uses the inline assembly path; the standalone PRG uses the C `mdjs.c` + stubs path. They send the same commands but via different code.
 
-## Known issue: first-call cold-bus flake
+## RESOLVED: first-call cold-bus flake (was: back-to-back command race)
 
-After a fresh RP boot, the FIRST round-trip `mdjs_call()` from the ST may return a result that the ST reads as zeros (alert shows "did not return"). Subsequent calls work consistently. Reproduces with both the cartridge demo and the standalone PRG. Investigated extensively without resolution; suspect a cartridge bus settle path or TOS-side cartridge access caching that we can't see from the RP side.
+Earlier we had a "first call after RP boot returns empty result" cosmetic bug
+that defied every fix we tried at the firmware/result-buffer level. Turned
+out the actual cause was **rate-limiting at the protocol-parser side**:
+back-to-back protocol commands on a freshly-booted SidecarTridge can race
+the cartridge bus settle path, causing one or more commands to be missed
+by the RP's parser. On first run only, PING+UPLOAD would get swallowed and
+only the CALL would reach the dispatcher — so the call ran against an empty
+JS context, returned `function 'add' not found`, and the ST saw nothing
+useful in the result buffer.
 
-**Workarounds attempted that did NOT help:**
-- Memory barriers (`__dmb()`) before and after the flush
-- Full 2048-byte zero-padded flush (overwrites all stale tail data)
-- Flush-sequence counter spin-wait before unblocking the ST
-- Warm-up CALL of a dummy function before the real call
-- Warm-up reads of `$FAF100` on the ST side
-- Protocol parser reset at init
-- Stray-CALL drain window at init
+**Diagnosis:** with the standalone demo stripped to PING-only, three sequential
+runs produced exactly three `cmd=0x0010` dispatches and zero anomalies. With
+the full PING+UPLOAD+CALL demo, the first run consistently showed only a
+single `cmd=0x0012` (the CALL) reaching the parser. The full demo run
+sending three commands rapidly was the difference. Adding ~50ms between
+commands on the ST side completely eliminated the anomaly across all runs.
 
-**Documented user workaround:** call `mdjs_ping()` once at app startup. The first real call won't always succeed cold, so apps that care should retry on empty results.
+**Fix in tree:**
+- [mdjs.c](target/atarist/src/mdjs.c) `mdjs_settle()` — ~6ms busy-loop called
+  at the start of every command-emitting function except `mdjs_ping`. Users
+  get this transparently; no API change.
+- [main.s](target/atarist/src/main.s) `mdjsdemo_settle` — equivalent ~6ms
+  busy-loop invoked before UPLOAD and before CALL in the cartridge-embedded
+  demo (it can't use the C library).
+
+**Tuning was empirical, halving until failure.** Started at 50ms, halved
+repeatedly to 25ms → 12ms → 6ms, all reliable. Stopped at 6ms as a sensible
+floor with safety margin — going lower wasn't worth chasing diminishing
+returns. If you shorten it further, retest thoroughly across multiple cold
+boots and run counts.
+
+**`mdjs_poll` deliberately omitted** from the settle path because it's
+expected to be called rapidly in a polling loop. The async-call user should
+have already settled in `mdjs_call_async`, and the bus is warm by the time
+poll loops start.
+
+If a future change removes the settle entirely, expect first-run flakiness
+to return immediately. Don't touch unless you have a clear replacement.
 
 ## RP2040-side build quirks
 
