@@ -12,7 +12,14 @@ MD/JS turns your SidecarT into a persistent JavaScript Worker for the Atari ST, 
 
 To see this in action, simply install the microfirmware, open the cartridge icon on your ST's desktop (lower case `c` drive) and run `MDJSDEMO.PRG`.
 
+In addition, the MD/JS Code example is available to download, showing a more developed GEM client.
+
 Instructions for integrating MD/JS into your own ST apps are below.
+
+## What's next?
+
+- [ ] Make MD/JS Code editable
+- [ ] Add text-only HTTP fetch implementation
 
 ## Hardware requirements
 

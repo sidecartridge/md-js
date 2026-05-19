@@ -145,7 +145,10 @@ send_sync_command_to_sidecart:
     moveq   #0,d0                       | assume success
 .Lwait_token:
     cmp.l   (a1),d2
-    beq.s   .Ltoken_found
+    bne.s   .Ltoken_not_ready
+    cmp.l   RANDOM_TOKEN_SEED_ADDR,d2
+    bne.s   .Ltoken_found
+.Ltoken_not_ready:
     subq.l  #1,d7
     bne.s   .Lwait_token
     subq.l  #1,d0                       | timeout: d0 = -1
@@ -330,7 +333,10 @@ send_sync_write_command_to_sidecart:
     moveq   #0,d0
 .Lwait_write_token:
     cmp.l   (a1),d2
-    beq.s   .Lwrite_token_found
+    bne.s   .Lwrite_token_not_ready
+    cmp.l   RANDOM_TOKEN_SEED_ADDR,d2
+    bne.s   .Lwrite_token_found
+.Lwrite_token_not_ready:
     subq.l  #1,d6
     bne.s   .Lwait_write_token
     subq.l  #1,d0

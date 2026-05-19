@@ -1,81 +1,1019 @@
 /**
  * File: demo_gem.c
- * Description: MD/JS GEM demonstration application for Atari ST.
+ * Description: MD/JS Code — minimal GEM IDE for the SidecarTridge MD/JS
+ * JavaScript Worker. Built as MDJSCODE.PRG.
  *
- * Demonstrates the MD/JS JavaScript Worker:
- *   1. Pings the worker to confirm it is available.
- *   2. Uploads a simple "add" function: function add(a,b){ return a+b; }
- *   3. Calls add(a, b) with two random integers and shows the result.
+ * Layout:
+ *   - Toolbar strip at the top of the work area with "About" and "Run"
+ *   - Top fixed GEM window titled "Code"
+ *   - Bottom fixed GEM window titled "Result"
  *
- * Build with m68k-atari-mint-gcc (or equivalent 68000 cross-compiler):
- *   m68k-atari-mint-gcc -m68000 -O2 -fomit-frame-pointer \
- *       mdjs.c demo_gem.c -lgem -o MDJSCODE.PRG
- *
- * This is a standalone demo — run it from GEM desktop or place it in AUTO/.
+ * The Code window is read-only in this version; the IDE always calls a
+ * function named `main` on the uploaded code, with whatever args the user
+ * enters in the Run dialog.
  */
 
+#include <gem.h>
+#include <osbind.h>
 #include <stdio.h>
 #include <string.h>
 
-/* GEM AES / VDI bindings — provided by MiNTLib or Pure C */
-#include <gem.h>
-
-/* osbind.h provides GEMDOS/XBIOS traps (Random, Supexec, etc.) as inlines. */
-#include <osbind.h>
-
 #include "mdjs.h"
 
-/* Maximum length of a form_alert string */
-#define ALERT_BUF_SIZE 128
+static short app_id;
+static short aes_handle;
+static short sys_char_w, sys_char_h, sys_cell_w, sys_cell_h;
+static short desk_x, desk_y, desk_w, desk_h;
+static short toolbar_h;
 
-int main(void) {
-  int app_id;
-  char alert_str[ALERT_BUF_SIZE];
-  char args_str[16];
-  char result[64];
-  int err;
-  int a, b;
+static short toolbar_win = -1;
+static short code_win = -1;
+static short result_win = -1;
+static short quit_requested = 0;
+static short code_top_line = 0;
+static short result_top_line = 0;
+static short code_left_col = 0;
+static short result_left_col = 0;
 
-  /* Initialise GEM application */
-  app_id = appl_init();
-  if (app_id < 0) {
-    /* Cannot even open a dialog — just exit */
+static char current_code[512] =
+    "function main(name) {\n"
+    "  return 'Hello, ' + (name || 'World') + '!';\n"
+    "}\n"
+    "\n"
+    "/* Working editor coming soon! */";
+
+static char current_result[256] = "";
+
+static char about_button_label[] = "About";
+static char run_button_label[] = "Run";
+static char quit_button_label[] = "Quit";
+
+#define ARGS_LEN 32
+static char dialog_args[ARGS_LEN + 1];
+static char dialog_template[ARGS_LEN + 1];
+static char dialog_valid[ARGS_LEN + 1];
+
+enum { DL_ROOT = 0, DL_LABEL, DL_INPUT, DL_OK, DL_CANCEL };
+
+#define DL_COUNT 5
+
+static char d_label[] = "Parameters in JSON format:";
+static char d_ok[] = "OK";
+static char d_cancel[] = "Cancel";
+
+static OBJECT dialog_tree[DL_COUNT];
+static TEDINFO dialog_ted;
+
+static short line_height(void) {
+  short h = (short)(sys_char_h + 2);
+  if (h < 10) {
+    h = 10;
+  }
+  return h;
+}
+
+static short count_text_lines(const char *text) {
+  short lines = 1;
+
+  if (!text || !text[0]) {
     return 1;
   }
 
-  /* ── 1. Ping the MD/JS worker ──────────────────────────────────── */
-  err = mdjs_ping();
-  if (err != 0) {
-    form_alert(1, "[1][MD/JS worker|not detected on|this device.][OK]");
-    appl_exit();
-    return 0;
+  while (*text) {
+    if (*text == '\n') {
+      lines++;
+    }
+    text++;
   }
 
-  /* ── 2. Upload JavaScript source ───────────────────────────────── */
-  err = mdjs_upload("function add(a,b){ return a+b; }");
-  if (err != 0) {
-    form_alert(1, "[1][MD/JS upload|failed.][OK]");
-    appl_exit();
-    return 0;
+  return lines;
+}
+
+static short max_text_columns(const char *text) {
+  short max_cols = 0;
+  short cols = 0;
+
+  if (!text || !text[0]) {
+    return 7;
   }
 
-  /* ── 3. Call add(a, b) with random a, b in 1..8 ───────────────── */
-  a = (int)(Random() & 7) + 1;
-  b = (int)(Random() & 7) + 1;
-  snprintf(args_str, sizeof(args_str), "[%d,%d]", a, b);
+  while (*text) {
+    if (*text == '\n') {
+      if (cols > max_cols) {
+        max_cols = cols;
+      }
+      cols = 0;
+    } else {
+      cols++;
+    }
+    text++;
+  }
+
+  if (cols > max_cols) {
+    max_cols = cols;
+  }
+
+  return max_cols;
+}
+
+static short visible_lines_for_window(short win) {
+  short wx, wy, ww, wh;
+  short lh;
+  short visible;
+
+  wind_get(win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+  lh = line_height();
+  visible = (short)((wh - 4) / lh);
+  if (visible < 1) {
+    visible = 1;
+  }
+  return visible;
+}
+
+static short visible_columns_for_window(short win) {
+  short wx, wy, ww, wh;
+  short visible;
+
+  wind_get(win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+  visible = (short)((ww - 8) / sys_char_w);
+  if (visible < 1) {
+    visible = 1;
+  }
+  return visible;
+}
+
+static short max_top_line_for_window(short win, const char *text) {
+  short total = count_text_lines(text);
+  short visible = visible_lines_for_window(win);
+
+  if (total <= visible) {
+    return 0;
+  }
+  return (short)(total - visible);
+}
+
+static short max_left_col_for_window(short win, const char *text) {
+  short total = max_text_columns(text);
+  short visible = visible_columns_for_window(win);
+
+  if (total <= visible) {
+    return 0;
+  }
+  return (short)(total - visible);
+}
+
+static void update_window_sliders(short win, const char *text, short top_line,
+                                  short left_col) {
+  short total = count_text_lines(text);
+  short visible = visible_lines_for_window(win);
+  short max_top = max_top_line_for_window(win, text);
+  short total_cols = max_text_columns(text);
+  short visible_cols = visible_columns_for_window(win);
+  short max_left = max_left_col_for_window(win, text);
+  short size;
+  short pos;
+
+  if (total <= visible) {
+    size = 1000;
+    pos = 0;
+  } else {
+    size = (short)((1000L * visible) / total);
+    if (size < 1) {
+      size = 1;
+    }
+    pos = (short)((1000L * top_line) / max_top);
+  }
+
+  wind_set(win, WF_VSLSIZE, size, 0, 0, 0);
+  wind_set(win, WF_VSLIDE, pos, 0, 0, 0);
+
+  if (total_cols <= visible_cols) {
+    size = 1000;
+    pos = 0;
+  } else {
+    size = (short)((1000L * visible_cols) / total_cols);
+    if (size < 1) {
+      size = 1;
+    }
+    pos = (short)((1000L * left_col) / max_left);
+  }
+
+  wind_set(win, WF_HSLSIZE, size, 0, 0, 0);
+  wind_set(win, WF_HSLIDE, pos, 0, 0, 0);
+}
+
+static void redraw_all(void);
+static void focus_result_window(void);
+static void present_result_window(void);
+
+static void set_result_text(const char *text) {
+  if (!text || !text[0]) {
+    current_result[0] = '\0';
+  } else {
+    strncpy(current_result, text, sizeof(current_result) - 1);
+    current_result[sizeof(current_result) - 1] = '\0';
+  }
+  result_top_line = 0;
+  result_left_col = 0;
+}
+
+static void set_result_error_with_fallback(const char *fallback) {
+  char buf[256];
+
+  buf[0] = '\0';
+  if (mdjs_result(buf, (int)sizeof(buf)) == 0 && buf[0] != '\0') {
+    set_result_text(buf);
+  } else {
+    set_result_text(fallback);
+  }
+}
+
+static void obfix_tree(OBJECT *tree, short count) {
+  short i;
+
+  for (i = 0; i < count; i++) {
+    rsrc_obfix(tree, i);
+  }
+}
+
+static void build_dialog(void) {
+  short label_w = (short)strlen(d_label);
+  short dlg_w = (short)(label_w + 4);
+  short dlg_h = 7;
+  short input_w = ARGS_LEN;
+  short btn_w = 8;
+  short i;
+
+  for (i = 0; i < ARGS_LEN; i++) {
+    dialog_template[i] = '_';
+    dialog_valid[i] = 'X';
+  }
+  dialog_template[ARGS_LEN] = '\0';
+  dialog_valid[ARGS_LEN] = '\0';
+
+  strcpy(dialog_args, "[]");
+  for (i = (short)strlen(dialog_args); i < ARGS_LEN; i++) {
+    dialog_args[i] = '\0';
+  }
+
+  if (input_w + 4 > dlg_w) {
+    dlg_w = (short)(input_w + 4);
+  }
+
+  dialog_ted.te_ptext = dialog_args;
+  dialog_ted.te_ptmplt = dialog_template;
+  dialog_ted.te_pvalid = dialog_valid;
+  dialog_ted.te_font = 3;
+  dialog_ted.te_fontid = 0;
+  dialog_ted.te_just = 0;
+  dialog_ted.te_color = 0x1180;
+  dialog_ted.te_fontsize = 0;
+  dialog_ted.te_thickness = -1;
+  dialog_ted.te_txtlen = ARGS_LEN + 1;
+  dialog_ted.te_tmplen = ARGS_LEN + 1;
+
+  dialog_tree[DL_ROOT].ob_next = -1;
+  dialog_tree[DL_ROOT].ob_head = DL_LABEL;
+  dialog_tree[DL_ROOT].ob_tail = DL_CANCEL;
+  dialog_tree[DL_ROOT].ob_type = G_BOX;
+  dialog_tree[DL_ROOT].ob_flags = OF_NONE;
+  dialog_tree[DL_ROOT].ob_state = OS_OUTLINED;
+  dialog_tree[DL_ROOT].ob_spec.index = 0x21100L;
+  dialog_tree[DL_ROOT].ob_x = 0;
+  dialog_tree[DL_ROOT].ob_y = 0;
+  dialog_tree[DL_ROOT].ob_width = dlg_w;
+  dialog_tree[DL_ROOT].ob_height = dlg_h;
+
+  dialog_tree[DL_LABEL].ob_next = DL_INPUT;
+  dialog_tree[DL_LABEL].ob_head = -1;
+  dialog_tree[DL_LABEL].ob_tail = -1;
+  dialog_tree[DL_LABEL].ob_type = G_STRING;
+  dialog_tree[DL_LABEL].ob_flags = OF_NONE;
+  dialog_tree[DL_LABEL].ob_state = OS_NORMAL;
+  dialog_tree[DL_LABEL].ob_spec.free_string = d_label;
+  dialog_tree[DL_LABEL].ob_x = 2;
+  dialog_tree[DL_LABEL].ob_y = 1;
+  dialog_tree[DL_LABEL].ob_width = label_w;
+  dialog_tree[DL_LABEL].ob_height = 1;
+
+  dialog_tree[DL_INPUT].ob_next = DL_OK;
+  dialog_tree[DL_INPUT].ob_head = -1;
+  dialog_tree[DL_INPUT].ob_tail = -1;
+  dialog_tree[DL_INPUT].ob_type = G_FTEXT;
+  dialog_tree[DL_INPUT].ob_flags = OF_EDITABLE;
+  dialog_tree[DL_INPUT].ob_state = OS_NORMAL;
+  dialog_tree[DL_INPUT].ob_spec.tedinfo = &dialog_ted;
+  dialog_tree[DL_INPUT].ob_x = 2;
+  dialog_tree[DL_INPUT].ob_y = 3;
+  dialog_tree[DL_INPUT].ob_width = input_w;
+  dialog_tree[DL_INPUT].ob_height = 1;
+
+  dialog_tree[DL_OK].ob_next = DL_CANCEL;
+  dialog_tree[DL_OK].ob_head = -1;
+  dialog_tree[DL_OK].ob_tail = -1;
+  dialog_tree[DL_OK].ob_type = G_BUTTON;
+  dialog_tree[DL_OK].ob_flags = OF_SELECTABLE | OF_EXIT | OF_DEFAULT;
+  dialog_tree[DL_OK].ob_state = OS_NORMAL;
+  dialog_tree[DL_OK].ob_spec.free_string = d_ok;
+  dialog_tree[DL_OK].ob_x = 2;
+  dialog_tree[DL_OK].ob_y = 5;
+  dialog_tree[DL_OK].ob_width = btn_w;
+  dialog_tree[DL_OK].ob_height = 1;
+
+  dialog_tree[DL_CANCEL].ob_next = DL_ROOT;
+  dialog_tree[DL_CANCEL].ob_head = -1;
+  dialog_tree[DL_CANCEL].ob_tail = -1;
+  dialog_tree[DL_CANCEL].ob_type = G_BUTTON;
+  dialog_tree[DL_CANCEL].ob_flags = OF_SELECTABLE | OF_EXIT | OF_LASTOB;
+  dialog_tree[DL_CANCEL].ob_state = OS_NORMAL;
+  dialog_tree[DL_CANCEL].ob_spec.free_string = d_cancel;
+  dialog_tree[DL_CANCEL].ob_x = (short)(dlg_w - btn_w - 2);
+  dialog_tree[DL_CANCEL].ob_y = 5;
+  dialog_tree[DL_CANCEL].ob_width = btn_w;
+  dialog_tree[DL_CANCEL].ob_height = 1;
+
+  obfix_tree(dialog_tree, DL_COUNT);
+}
+
+static void open_windows(void) {
+  short content_y;
+  short content_h;
+  short half_h;
+
+  wind_get(0, WF_WORKXYWH, &desk_x, &desk_y, &desk_w, &desk_h);
+
+  toolbar_h = (short)(sys_cell_h + 10);
+  if (toolbar_h < 18) {
+    toolbar_h = 18;
+  }
+
+  toolbar_win = wind_create(0, desk_x, desk_y, desk_w, toolbar_h);
+  if (toolbar_win >= 0) {
+    wind_open(toolbar_win, desk_x, desk_y, desk_w, toolbar_h);
+  }
+
+  content_y = (short)(desk_y + toolbar_h);
+  content_h = (short)(desk_h - toolbar_h);
+  half_h = (short)(content_h / 2);
+
+  code_win = wind_create(
+      NAME | CLOSER | UPARROW | DNARROW | VSLIDE | LFARROW | RTARROW | HSLIDE,
+      desk_x, content_y, desk_w, half_h);
+  if (code_win < 0) {
+    return;
+  }
+  wind_set_str(code_win, WF_NAME, " Code ");
+  wind_open(code_win, desk_x, content_y, desk_w, half_h);
+
+  result_win = wind_create(
+      NAME | CLOSER | UPARROW | DNARROW | VSLIDE | LFARROW | RTARROW | HSLIDE,
+      desk_x, (short)(content_y + half_h), desk_w, (short)(content_h - half_h));
+  if (result_win < 0) {
+    return;
+  }
+  wind_set_str(result_win, WF_NAME, " Result ");
+  wind_open(result_win, desk_x, (short)(content_y + half_h), desk_w,
+            (short)(content_h - half_h));
+
+  update_window_sliders(code_win, current_code, code_top_line, code_left_col);
+  update_window_sliders(result_win, current_result, result_top_line,
+                        result_left_col);
+
+  /* Keep Code focused at startup even though Result is opened afterwards. */
+  wind_set(code_win, WF_TOP, 0, 0, 0, 0);
+}
+
+static void get_toolbar_layout(short *about_x, short *about_y, short *about_w,
+                               short *about_h, short *run_x, short *run_y,
+                               short *run_w, short *run_h, short *quit_x,
+                               short *quit_y, short *quit_w, short *quit_h) {
+  short wx, wy, ww, wh;
+  short btn_h;
+  short btn_y;
+
+  wind_get(toolbar_win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+
+  btn_h = (short)(sys_char_h + 4);
+  if (btn_h < 12) {
+    btn_h = 12;
+  }
+  btn_y = (short)(wy + ((wh - btn_h) / 2));
+
+  *about_x = (short)(wx + 8);
+  *about_y = btn_y;
+  *about_w = (short)((short)strlen(about_button_label) * sys_char_w + 14);
+  *about_h = btn_h;
+
+  *run_x = (short)(*about_x + *about_w + 8);
+  *run_y = btn_y;
+  *run_w = (short)((short)strlen(run_button_label) * sys_char_w + 14);
+  *run_h = btn_h;
+
+  *quit_w = (short)((short)strlen(quit_button_label) * sys_char_w + 14);
+  *quit_h = btn_h;
+  *quit_x = (short)(wx + ww - *quit_w - 8);
+  *quit_y = btn_y;
+}
+
+static void fill_clip_rect(short x, short y, short w, short h) {
+  short pxy[4];
+
+  pxy[0] = x;
+  pxy[1] = y;
+  pxy[2] = (short)(x + w - 1);
+  pxy[3] = (short)(y + h - 1);
+
+  vswr_mode(aes_handle, MD_REPLACE);
+  vsf_color(aes_handle, 0);
+  vsf_interior(aes_handle, FIS_SOLID);
+  vsf_perimeter(aes_handle, 0);
+  vr_recfl(aes_handle, pxy);
+}
+
+static void draw_button(short x, short y, short w, short h, const char *label) {
+  short fill[4];
+  short outline[10];
+  short text_x;
+  short text_y;
+
+  fill[0] = x;
+  fill[1] = y;
+  fill[2] = (short)(x + w - 1);
+  fill[3] = (short)(y + h - 1);
+
+  vswr_mode(aes_handle, MD_REPLACE);
+  vsf_color(aes_handle, 0);
+  vsf_interior(aes_handle, FIS_SOLID);
+  vsf_perimeter(aes_handle, 0);
+  vr_recfl(aes_handle, fill);
+
+  outline[0] = x;
+  outline[1] = y;
+  outline[2] = (short)(x + w - 1);
+  outline[3] = y;
+  outline[4] = (short)(x + w - 1);
+  outline[5] = (short)(y + h - 1);
+  outline[6] = x;
+  outline[7] = (short)(y + h - 1);
+  outline[8] = x;
+  outline[9] = y;
+
+  vswr_mode(aes_handle, MD_REPLACE);
+  vsl_color(aes_handle, 1);
+  v_pline(aes_handle, 5, outline);
+
+  text_x = (short)(x + ((w - ((short)strlen(label) * sys_char_w)) / 2));
+  text_y = (short)(y + ((h - sys_char_h) / 2) + sys_char_h - 1);
+  vst_effects(aes_handle, 0);
+  vst_color(aes_handle, 1);
+  v_gtext(aes_handle, text_x, text_y, (char *)label);
+}
+
+static void draw_multiline_text(const char *text, short left, short top,
+                                short bottom, short first_line,
+                                short first_col) {
+  short line_y;
+  short line_h;
+  char line_buf[160];
+  short current_line = 0;
+
+  line_h = line_height();
+  line_y = (short)(top + sys_char_h);
+
+  vswr_mode(aes_handle, MD_REPLACE);
+  vst_effects(aes_handle, 0);
+  vst_color(aes_handle, 1);
+
+  if (text && text[0]) {
+    const char *p = text;
+    while (*p && line_y + sys_char_h <= bottom) {
+      const char *eol = p;
+      short len;
+
+      while (*eol && *eol != '\n') {
+        eol++;
+      }
+      len = (short)(eol - p);
+      if (len > (short)(sizeof(line_buf) - 1)) {
+        len = (short)(sizeof(line_buf) - 1);
+      }
+
+      if (current_line >= first_line) {
+        short copy_start = first_col;
+        short copy_len = len;
+
+        if (copy_start > copy_len) {
+          copy_start = copy_len;
+        }
+        copy_len = (short)(copy_len - copy_start);
+        if (copy_len > (short)(sizeof(line_buf) - 1)) {
+          copy_len = (short)(sizeof(line_buf) - 1);
+        }
+        memcpy(line_buf, p + copy_start, (size_t)copy_len);
+        line_buf[copy_len] = '\0';
+        v_gtext(aes_handle, left, line_y, line_buf);
+        line_y = (short)(line_y + line_h);
+      }
+      current_line++;
+      if (*eol == '\0') {
+        break;
+      }
+      p = eol + 1;
+    }
+  } else {
+    v_gtext(aes_handle, left, line_y, "(empty)");
+  }
+}
+
+static void redraw_toolbar_window(void) {
+  short clip_x, clip_y, clip_w, clip_h;
+  short about_x, about_y, about_w, about_h;
+  short run_x, run_y, run_w, run_h;
+  short quit_x, quit_y, quit_w, quit_h;
+  short clip[4];
+
+  if (toolbar_win < 0) {
+    return;
+  }
+
+  wind_update(BEG_UPDATE);
+  graf_mouse(M_OFF, NULL);
+
+  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h, &run_x, &run_y,
+                     &run_w, &run_h, &quit_x, &quit_y, &quit_w, &quit_h);
+
+  wind_get(toolbar_win, WF_FIRSTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
+  while (clip_w > 0 && clip_h > 0) {
+    clip[0] = clip_x;
+    clip[1] = clip_y;
+    clip[2] = (short)(clip_x + clip_w - 1);
+    clip[3] = (short)(clip_y + clip_h - 1);
+
+    vs_clip(aes_handle, 1, clip);
+    fill_clip_rect(clip_x, clip_y, clip_w, clip_h);
+    draw_button(about_x, about_y, about_w, about_h, about_button_label);
+    draw_button(run_x, run_y, run_w, run_h, run_button_label);
+    draw_button(quit_x, quit_y, quit_w, quit_h, quit_button_label);
+    vs_clip(aes_handle, 0, clip);
+
+    wind_get(toolbar_win, WF_NEXTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
+  }
+
+  graf_mouse(M_ON, NULL);
+  graf_mouse(ARROW, NULL);
+  wind_update(END_UPDATE);
+}
+
+static void redraw_code_window(void) {
+  short clip_x, clip_y, clip_w, clip_h;
+  short work_x, work_y, work_w, work_h;
+  short clip[4];
+
+  if (code_win < 0) {
+    return;
+  }
+
+  wind_update(BEG_UPDATE);
+  graf_mouse(M_OFF, NULL);
+
+  wind_get(code_win, WF_WORKXYWH, &work_x, &work_y, &work_w, &work_h);
+  wind_get(code_win, WF_FIRSTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
+  while (clip_w > 0 && clip_h > 0) {
+    clip[0] = clip_x;
+    clip[1] = clip_y;
+    clip[2] = (short)(clip_x + clip_w - 1);
+    clip[3] = (short)(clip_y + clip_h - 1);
+
+    vs_clip(aes_handle, 1, clip);
+    fill_clip_rect(clip_x, clip_y, clip_w, clip_h);
+    draw_multiline_text(current_code, (short)(work_x + 4), work_y,
+                        (short)(work_y + work_h - 4), code_top_line,
+                        code_left_col);
+    vs_clip(aes_handle, 0, clip);
+
+    wind_get(code_win, WF_NEXTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
+  }
+
+  graf_mouse(M_ON, NULL);
+  graf_mouse(ARROW, NULL);
+  wind_update(END_UPDATE);
+  update_window_sliders(code_win, current_code, code_top_line, code_left_col);
+}
+
+static void redraw_result_window(void) {
+  short clip_x, clip_y, clip_w, clip_h;
+  short work_x, work_y, work_w, work_h;
+  short clip[4];
+
+  if (result_win < 0) {
+    return;
+  }
+
+  wind_update(BEG_UPDATE);
+  graf_mouse(M_OFF, NULL);
+
+  wind_get(result_win, WF_WORKXYWH, &work_x, &work_y, &work_w, &work_h);
+  wind_get(result_win, WF_FIRSTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
+  while (clip_w > 0 && clip_h > 0) {
+    clip[0] = clip_x;
+    clip[1] = clip_y;
+    clip[2] = (short)(clip_x + clip_w - 1);
+    clip[3] = (short)(clip_y + clip_h - 1);
+
+    vs_clip(aes_handle, 1, clip);
+    fill_clip_rect(clip_x, clip_y, clip_w, clip_h);
+    draw_multiline_text(current_result, (short)(work_x + 4), work_y,
+                        (short)(work_y + work_h - 4), result_top_line,
+                        result_left_col);
+    vs_clip(aes_handle, 0, clip);
+
+    wind_get(result_win, WF_NEXTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
+  }
+
+  graf_mouse(M_ON, NULL);
+  graf_mouse(ARROW, NULL);
+  wind_update(END_UPDATE);
+  update_window_sliders(result_win, current_result, result_top_line,
+                        result_left_col);
+}
+
+static void do_redraw(short win) {
+  if (win == toolbar_win) {
+    redraw_toolbar_window();
+  } else if (win == code_win) {
+    redraw_code_window();
+  } else if (win == result_win) {
+    redraw_result_window();
+  }
+}
+
+static short run_dialog(void) {
+  short x, y, w, h;
+  short exit_obj;
+
+  strcpy(dialog_args, "[]");
+
+  wind_update(BEG_UPDATE);
+  wind_update(BEG_MCTRL);
+  form_center(dialog_tree, &x, &y, &w, &h);
+  form_dial(FMD_START, 0, 0, 0, 0, x, y, w, h);
+  form_dial(FMD_GROW, 0, 0, 0, 0, x, y, w, h);
+
+  objc_draw(dialog_tree, ROOT, MAX_DEPTH, x, y, w, h);
+  exit_obj = (short)(form_do(dialog_tree, DL_INPUT) & 0x7FFF);
+  dialog_tree[exit_obj].ob_state &= ~OS_SELECTED;
+
+  form_dial(FMD_SHRINK, x, y, w, h, 0, 0, 0, 0);
+  form_dial(FMD_FINISH, x, y, w, h, 0, 0, 0, 0);
+  wind_update(END_MCTRL);
+  wind_update(END_UPDATE);
+  redraw_all();
+  graf_mouse(ARROW, NULL);
+
+  return (short)(exit_obj == DL_OK);
+}
+
+static void do_run(void) {
+  short err;
+  char args_input[ARGS_LEN + 4];
+  char result[256];
+
+  if (!run_dialog()) {
+    return;
+  }
+
+  {
+    short i, end;
+
+    strcpy(args_input, dialog_args);
+    end = (short)strlen(args_input);
+    for (i = (short)(end - 1); i >= 0; i--) {
+      if (args_input[i] == ' ' || args_input[i] == '_') {
+        args_input[i] = '\0';
+      } else {
+        break;
+      }
+    }
+    if (args_input[0] == '\0') {
+      strcpy(args_input, "[]");
+    }
+  }
+
+  err = (short)mdjs_ping();
+  if (err != 0) {
+    set_result_text("Error: no SidecarT or MD/JS not loaded.");
+    present_result_window();
+    return;
+  }
+
+  err = (short)mdjs_upload(current_code);
+  if (err != 0) {
+    set_result_error_with_fallback("Error: upload failed.");
+    present_result_window();
+    return;
+  }
 
   memset(result, 0, sizeof(result));
-  err = mdjs_call("add", args_str, result, (int)sizeof(result));
+  err = (short)mdjs_call("main", args_input, result, (int)sizeof(result));
   if (err != 0) {
-    form_alert(1, "[1][MD/JS call|failed.][OK]");
-    appl_exit();
-    return 0;
+    set_result_error_with_fallback("Error: call failed.");
+    present_result_window();
+    return;
   }
 
-  /* ── 4. Show the result ────────────────────────────────────────── */
-  snprintf(alert_str, ALERT_BUF_SIZE,
-           "[1][MD/JS Demo|add(%d,%d) = %s][OK]", a, b, result);
-  form_alert(1, alert_str);
+  set_result_text(result);
+  present_result_window();
+}
+
+static void do_about(void) {
+  wind_update(BEG_UPDATE);
+  wind_update(BEG_MCTRL);
+  form_alert(1,
+             "[1][MD/JS Code"
+             "| "
+             "|If you'd like to embed MD/JS"
+             "|in your ST app, visit:"
+             "|github.com/neilrackett/md-js][OK]");
+  wind_update(END_MCTRL);
+  wind_update(END_UPDATE);
+
+  redraw_all();
+  graf_mouse(ARROW, NULL);
+}
+
+static void scroll_window(short win, const char *text, short *top_line,
+                          short delta) {
+  short max_top = max_top_line_for_window(win, text);
+  short new_top = (short)(*top_line + delta);
+
+  if (new_top < 0) {
+    new_top = 0;
+  } else if (new_top > max_top) {
+    new_top = max_top;
+  }
+
+  if (new_top == *top_line) {
+    return;
+  }
+
+  *top_line = new_top;
+  do_redraw(win);
+}
+
+static void slider_window(short win, const char *text, short *top_line,
+                          short pos) {
+  short max_top = max_top_line_for_window(win, text);
+  short new_top;
+
+  if (max_top <= 0) {
+    new_top = 0;
+  } else {
+    new_top = (short)((pos * max_top + 500L) / 1000L);
+  }
+
+  if (new_top == *top_line) {
+    return;
+  }
+
+  *top_line = new_top;
+  do_redraw(win);
+}
+
+static void hscroll_window(short win, const char *text, short *left_col,
+                           short delta) {
+  short max_left = max_left_col_for_window(win, text);
+  short new_left = (short)(*left_col + delta);
+
+  if (new_left < 0) {
+    new_left = 0;
+  } else if (new_left > max_left) {
+    new_left = max_left;
+  }
+
+  if (new_left == *left_col) {
+    return;
+  }
+
+  *left_col = new_left;
+  do_redraw(win);
+}
+
+static void hslider_window(short win, const char *text, short *left_col,
+                           short pos) {
+  short max_left = max_left_col_for_window(win, text);
+  short new_left;
+
+  if (max_left <= 0) {
+    new_left = 0;
+  } else {
+    new_left = (short)((pos * max_left + 500L) / 1000L);
+  }
+
+  if (new_left == *left_col) {
+    return;
+  }
+
+  *left_col = new_left;
+  do_redraw(win);
+}
+
+static void handle_toolbar_click(short mouse_x, short mouse_y) {
+  short about_x, about_y, about_w, about_h;
+  short run_x, run_y, run_w, run_h;
+  short quit_x, quit_y, quit_w, quit_h;
+
+  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h, &run_x, &run_y,
+                     &run_w, &run_h, &quit_x, &quit_y, &quit_w, &quit_h);
+
+  if (mouse_x >= about_x && mouse_x < about_x + about_w && mouse_y >= about_y &&
+      mouse_y < about_y + about_h) {
+    do_about();
+  } else if (mouse_x >= run_x && mouse_x < run_x + run_w && mouse_y >= run_y &&
+             mouse_y < run_y + run_h) {
+    do_run();
+  } else if (mouse_x >= quit_x && mouse_x < quit_x + quit_w &&
+             mouse_y >= quit_y && mouse_y < quit_y + quit_h) {
+    quit_requested = 1;
+  }
+}
+
+static void event_loop(void) {
+  short ev;
+  short msg[8];
+  short mx, my, mb, ks, key, clicks;
+  short last_mb;
+
+  redraw_toolbar_window();
+  redraw_code_window();
+  redraw_result_window();
+  graf_mkstate(&mx, &my, &last_mb, &ks);
+
+  while (!quit_requested) {
+    ev = evnt_multi(MU_MESAG | MU_TIMER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    msg, 20L, &mx, &my, &mb, &ks, &key, &clicks);
+
+    if (last_mb == 0 && mb != 0) {
+      short wx, wy, ww, wh;
+
+      if (toolbar_win >= 0) {
+        wind_get(toolbar_win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+        if (mx >= wx && mx < wx + ww && my >= wy && my < wy + wh) {
+          handle_toolbar_click(mx, my);
+        }
+      }
+    }
+    last_mb = mb;
+
+    if (!(ev & MU_MESAG)) {
+      continue;
+    }
+
+    switch (msg[0]) {
+      case WM_REDRAW:
+        do_redraw(msg[3]);
+        break;
+
+      case WM_ARROWED:
+        if (msg[3] == code_win) {
+          switch (msg[4]) {
+            case WA_UPLINE:
+              scroll_window(code_win, current_code, &code_top_line, -1);
+              break;
+            case WA_DNLINE:
+              scroll_window(code_win, current_code, &code_top_line, 1);
+              break;
+            case WA_UPPAGE:
+              scroll_window(code_win, current_code, &code_top_line,
+                            -visible_lines_for_window(code_win));
+              break;
+            case WA_DNPAGE:
+              scroll_window(code_win, current_code, &code_top_line,
+                            visible_lines_for_window(code_win));
+              break;
+            case WA_LFLINE:
+              hscroll_window(code_win, current_code, &code_left_col, -1);
+              break;
+            case WA_RTLINE:
+              hscroll_window(code_win, current_code, &code_left_col, 1);
+              break;
+            case WA_LFPAGE:
+              hscroll_window(code_win, current_code, &code_left_col,
+                             -visible_columns_for_window(code_win));
+              break;
+            case WA_RTPAGE:
+              hscroll_window(code_win, current_code, &code_left_col,
+                             visible_columns_for_window(code_win));
+              break;
+          }
+        } else if (msg[3] == result_win) {
+          switch (msg[4]) {
+            case WA_UPLINE:
+              scroll_window(result_win, current_result, &result_top_line, -1);
+              break;
+            case WA_DNLINE:
+              scroll_window(result_win, current_result, &result_top_line, 1);
+              break;
+            case WA_UPPAGE:
+              scroll_window(result_win, current_result, &result_top_line,
+                            -visible_lines_for_window(result_win));
+              break;
+            case WA_DNPAGE:
+              scroll_window(result_win, current_result, &result_top_line,
+                            visible_lines_for_window(result_win));
+              break;
+            case WA_LFLINE:
+              hscroll_window(result_win, current_result, &result_left_col, -1);
+              break;
+            case WA_RTLINE:
+              hscroll_window(result_win, current_result, &result_left_col, 1);
+              break;
+            case WA_LFPAGE:
+              hscroll_window(result_win, current_result, &result_left_col,
+                             -visible_columns_for_window(result_win));
+              break;
+            case WA_RTPAGE:
+              hscroll_window(result_win, current_result, &result_left_col,
+                             visible_columns_for_window(result_win));
+              break;
+          }
+        }
+        break;
+
+      case WM_VSLID:
+        if (msg[3] == code_win) {
+          slider_window(code_win, current_code, &code_top_line, msg[4]);
+        } else if (msg[3] == result_win) {
+          slider_window(result_win, current_result, &result_top_line, msg[4]);
+        }
+        break;
+
+      case WM_HSLID:
+        if (msg[3] == code_win) {
+          hslider_window(code_win, current_code, &code_left_col, msg[4]);
+        } else if (msg[3] == result_win) {
+          hslider_window(result_win, current_result, &result_left_col, msg[4]);
+        }
+        break;
+
+      case WM_TOPPED:
+        wind_set(msg[3], WF_TOP, 0, 0, 0, 0);
+        break;
+
+      case WM_CLOSED:
+        quit_requested = 1;
+        break;
+
+      default:
+        break;
+    }
+  }
+}
+
+static void redraw_all(void) {
+  redraw_toolbar_window();
+  redraw_code_window();
+  redraw_result_window();
+}
+
+static void focus_result_window(void) {
+  if (code_win >= 0) {
+    wind_set(code_win, WF_TOP, 0, 0, 0, 0);
+  }
+  if (result_win >= 0) {
+    wind_set(result_win, WF_TOP, 0, 0, 0, 0);
+  }
+}
+
+static void present_result_window(void) {
+  redraw_all();
+  focus_result_window();
+  redraw_all();
+}
+
+int main(void) {
+  app_id = appl_init();
+  if (app_id < 0) {
+    return 1;
+  }
+
+  aes_handle = graf_handle(&sys_char_w, &sys_char_h, &sys_cell_w, &sys_cell_h);
+
+  build_dialog();
+  open_windows();
+  event_loop();
+
+  if (toolbar_win >= 0) {
+    wind_close(toolbar_win);
+    wind_delete(toolbar_win);
+  }
+  if (code_win >= 0) {
+    wind_close(code_win);
+    wind_delete(code_win);
+  }
+  if (result_win >= 0) {
+    wind_close(result_win);
+    wind_delete(result_win);
+  }
 
   appl_exit();
   return 0;
