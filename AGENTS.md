@@ -7,7 +7,7 @@ Quick reference for humans and LLMs working on this repo. Read this before touch
 MD/JS is a microfirmware app for the SidecarTridge Multi-device (RP2040-based ROM cartridge for Atari ST). It exposes a JavaScript Worker: the ST uploads JS source via the cartridge bus, calls named functions with JSON args, and reads back JSON results from a shared memory region at `$FAF100`.
 
 - **Core 0** — ROM emulator + tprotocol command decoder + `js_worker_loop()`
-- **Core 1** — JerryScript v3.0.0 runtime (48 KB heap, `JERRY_EXTERNAL_CONTEXT=ON`)
+- **Core 1** — JerryScript v3.0.0 runtime (32 KB heap, `JERRY_EXTERNAL_CONTEXT=ON`; reduced from 48 KB to free RAM for lwIP/CYW43 when network is enabled)
 - **ST side** — `mdjs.c` / `mdjs.h` C library + `sidecart_stubs.S` (GAS-syntax wrappers for the bus protocol)
 
 ## Environment setup
@@ -58,7 +58,9 @@ rp/src/
   js_worker.h / include/js_worker.h
                         Command IDs (0x10–0x15), JS_STATUS_OFFSET, MDJS_STATUS_* constants,
                         message block struct, API
-  jerry_port.c          Minimal JerryScript port layer (context, log, fatal, stubs)
+  jerry_port.c          Minimal JerryScript port layer (context, log, fatal, stubs); JERRY_HEAP_BYTES = 32 KB
+  js_fetch.c            Native fetch() implementation (Core 1 side); build_response(), fetch_handler()
+  include/js_fetch.h    Public API: js_fetch_init() — call after jerry_init()
   term.c / term.h       tprotocol buffer management; exposes term_consume_protocol()
   include/tprotocol.h   TransmissionProtocol struct, MAX_PROTOCOL_PAYLOAD_SIZE (2112)
 
@@ -70,7 +72,10 @@ target/atarist/src/
 examples/mdjscode/
   main.c                MD/JS Code — GEM editor/runner for MDJSCODE.PRG
   textedit.c / .h       Scrollable text editor widget (reusable)
-  Makefile              Standalone build; run as: ST_WORKING_FOLDER=<repo-root> stcmd make -C examples/mdjscode
+  math.js               Example: basic arithmetic functions
+  fetch.js              Example: async fetch() + response.json()
+  Makefile              Standalone build; run as: STCMD_NO_TTY=1 make examples from repo root
+                        (or: ST_WORKING_FOLDER=<repo-root> stcmd make -C examples/mdjscode)
 ```
 
 ## JerryScript integration — known pitfalls
@@ -98,7 +103,7 @@ Commands flow ST → Core 0 (tprotocol decode) → FIFO push → Core 1 (JerrySc
 - Shared data: `JsWorkerMsgBlock s_msg` in `js_worker.c`, protected by spin-lock 14 (`JS_SPINLOCK_ID`).
 - Result buffer: `__rom_in_ram_start__ + JS_RESULT_OFFSET (0xF100)`, readable by ST at `$FAF100`.
 - Async status word: `__rom_in_ram_start__ + JS_STATUS_OFFSET (0xF008)`, readable by ST at `$FAF008` as a single byte (no bus transaction needed).
-- Timeout: `JS_CALL_TIMEOUT_US` (5 seconds). On timeout, Core 0 writes `{"error":"timeout"}` and restarts Core 1 with `multicore_reset_core1()`. Both sync and async paths use the shared `js_write_timeout_error()` helper.
+- Timeout: `JS_CALL_TIMEOUT_US` (10 seconds — raised from 5s to accommodate HTTP round-trips). On timeout, Core 0 writes `{"error":"timeout"}` and restarts Core 1 with `multicore_reset_core1()`. Both sync and async paths use the shared `js_write_timeout_error()` helper.
 - Core 1 calls `jerry_cleanup()` then `jerry_init()` at startup — this handles both first boot and post-timeout restart.
 
 ### Async call flow (`CMD_JS_CALL_ASYNC = 0x14`)
@@ -137,6 +142,44 @@ Offset    ST address    Purpose
 0xF040    $FAF040       TERM shared variables (indices 0–15)
 0xF100    $FAF100       JS result buffer (2048 B)
 ```
+
+## Native fetch() implementation
+
+`fetch()` is exposed to JS as a global. HTTP only (no HTTPS), text/JSON responses, body capped at 4 KB.
+
+### Threading model
+
+`http_client_request_sync()` must run on Core 0 (owns the lwIP async context). Core 1 cannot call it directly. Protocol:
+
+1. JS calls `await fetch("http://...")` → `fetch_handler()` runs on Core 1
+2. Core 1 writes URL to `s_msg.fetch_url` under spin-lock, pushes `FIFO_MSG_FETCH_REQ`
+3. Core 0's `js_wait_for_core1()` loop sees `FIFO_MSG_FETCH_REQ`, calls `js_handle_fetch_request()`, pushes `FIFO_MSG_FETCH_OK/ERR`
+4. Core 1's `fetch_handler()` unblocks, reads body from `s_msg.fetch_body`, returns a resolved Promise
+5. `jerry_call()` returns the outer async function's pending Promise
+6. `jerry_run_jobs()` drains microtasks — the `await` continuation runs, the outer Promise settles
+7. `jerry_promise_result()` extracts the settled value for JSON serialisation
+
+**Key invariant:** `fetch_handler` is called from within `jerry_call()`, so Core 0 is already in `js_wait_for_core1()` and will service the FIFO_MSG_FETCH_REQ. There is no deadlock.
+
+### Response object properties
+
+`ok`, `status`, `statusText`, `url`, `redirected`, `type` (always `"basic"`), `bodyUsed` (always `false`), `text()`, `json()`
+
+### Enabling/disabling network
+
+Controlled by `MDJS_NO_NETWORK` in `rp/src/CMakeLists.txt` (0 = enabled, 1 = disabled). When enabled:
+- `emul.c` calls `network_wifiInit(WIFI_MODE_STA)` + `network_wifiStaConnect()` before `js_worker_init()`
+- WiFi credentials are read automatically from flash config (set via SidecarT config tool)
+- `js_fetch_init()` is called after `jerry_init()` in both `core1_entry()` and `core1_handle_reset()`
+
+### Known limitations
+
+- HTTP only — `https://` URLs return `{ok: false}`
+- Response body capped at 4 KB (`fetch_body[4096]` in `JsWorkerMsgBlock`)
+- `statusText` is always `"OK"` or `""` — httpc doesn't return the reason phrase
+- `redirected` is always `false` — httpc follows redirects silently without notifying the caller
+- No `headers` support — httpc callback doesn't capture response headers
+- No request options (method, headers, body) — GET only
 
 ## ST-side assembly linkage
 
@@ -197,7 +240,7 @@ Any new C-callable assembly wrapper must follow the same pattern. Symptom of get
 
 Two changes that are easy to undo and re-break:
 
-1. **Static context buffer** ([jerry_port.c](rp/src/jerry_port.c)) — JerryScript's context + heap lives in a static BSS buffer, NOT malloc. Calling `malloc()` from Core 1 is not safe on pico-sdk (newlib's lazy init races with Core 0). Buffer size: 48 KB heap + 8 KB context headroom. The 8 KB headroom is generous; `sizeof(jerry_context_t)` can grow with build flags, and a NULL `current_context_p` from a too-small buffer causes a silent fault in `jerry_init()`.
+1. **Static context buffer** ([jerry_port.c](rp/src/jerry_port.c)) — JerryScript's context + heap lives in a static BSS buffer, NOT malloc. Calling `malloc()` from Core 1 is not safe on pico-sdk (newlib's lazy init races with Core 0). Buffer size: **32 KB heap** (reduced from 48 KB to free ~16 KB for lwIP/CYW43 when `MDJS_NO_NETWORK=0`) + 8 KB context headroom. The 8 KB headroom is generous; `sizeof(jerry_context_t)` can grow with build flags, and a NULL `current_context_p` from a too-small buffer causes a silent fault in `jerry_init()`.
 
 2. **`__StackLimit` capped at end of RAM** ([memmap_rp.ld](rp/src/memmap_rp.ld)) — originally `ORIGIN(RAM) + LENGTH(RAM) + LENGTH(ROM_IN_RAM)`, which let `_sbrk` grow the libc heap into ROM_IN_RAM (the bus-shared cartridge emulation buffer). Now `ORIGIN(RAM) + LENGTH(RAM)` only. If you raise this back, malloc can corrupt the ST-visible memory.
 
@@ -284,7 +327,9 @@ to return immediately. Don't touch unless you have a clear replacement.
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | Boot message wrong / missing            | [main.s](target/atarist/src/main.s) `start_rom_code`, polls `$FAF00A` for magic `$4A`                      |
 | Demo always says "worker not detected"  | `mdjs_ping()` timing out — for standalone PRG, check [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S) parameter offsets (32-bit int!); ensure `examples/mdjscode/` was built and `MDJSCODE.PRG` deployed |
-| `function 'X' not found` for valid name | Byte-swap issue on CALL path or `add` actually wasn't defined — check UART for `Core 1 diag` and `Core 1 msg` |
+| `function 'X' not found` for valid name | Byte-swap issue on CALL path, or odd-length JS source was truncated (check `core1_handle_upload` even_size fix), or upload parse error — check UART for `Core 1 diag` and `Core 1 msg` |
+| `{}` returned from async function       | Promise not settled — `jerry_run_jobs()` must be called after `jerry_call()` when result `jerry_value_is_promise()`; see `core1_handle_call` in js_worker.c |
+| fetch() always returns `{ok:false}`     | WiFi not connected yet, or `https://` URL used, or timeout — check UART for `js_fetch:` lines |
 | Garbled chars in result                 | `core1_flush_result` not pre-swapping; check `COPY_AND_CHANGE_ENDIANESS_BLOCK16` is called                 |
 | Bombs / crash on demo exit              | Stack-resident demo code returning to corrupt SR/USP — check `mdjsdemo_cart_run`                            |
 | `ignoring command 0x0000` in UART       | Either bus noise (harmless) or C ABI int-size bug in stubs (broken)                                        |

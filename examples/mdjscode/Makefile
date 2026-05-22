@@ -8,7 +8,7 @@ CFLAGS = -m68000 -O2 -fomit-frame-pointer -I. -I$(LIB_DIR)
 
 .PHONY: all clean
 
-all: $(DIST_DIR)/$(BIN) $(DIST_DIR)/math.js
+all: $(DIST_DIR)/$(BIN) $(DIST_DIR)/math.js $(DIST_DIR)/fetch.js
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -33,6 +33,9 @@ $(DIST_DIR)/$(BIN): $(BUILD_DIR)/sidecart_stubs.o $(BUILD_DIR)/mdjs.o \
 	$(CC) $(CFLAGS) $^ -lgem -o $@
 
 $(DIST_DIR)/math.js: math.js | $(DIST_DIR)
+	cp $< $@
+
+$(DIST_DIR)/fetch.js: fetch.js | $(DIST_DIR)
 	cp $< $@
 
 clean:

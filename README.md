@@ -8,18 +8,24 @@ MD/JS turns your SidecarT into a persistent JavaScript Worker for the Atari ST, 
 
 - Upload JavaScript source from your ST
 - Call named functions with JSON arguments
+- Use ES5.1, ES6/2015 and most ES2020 features
+- Load text or JSON files using `fetch()`
 - Read JSON results
 
-To see this in action, simply install the microfirmware, open the cartridge icon on your ST's desktop (lower case `c` drive) and run `MDJSDEMO.PRG`.
+Although the following limits apply:
 
-In addition, the MD/JS Code example is [available to download](https://github.com/neilrackett/md-js/releases), showing a more developed GEM client.
+- 32KB JavaScript heap (48KB if compiled without fetch)
+- 2KB result buffer
 
-Instructions for integrating MD/JS into your own ST apps are below.
+To see MD/JS in action, simply install the microfirmware, open the cartridge icon on your ST's desktop (lower case `c` drive) and run `MDJSDEMO.PRG`.
 
-## What's next?
+If you'd like to integrating MD/JS into your own ST apps, instructions are below.
 
-- [ ] Make MD/JS Code editable
-- [ ] Add text-only HTTP fetch implementation
+## MD/JS Code
+
+![MD/JS Code](./examples/mdjscode/mdjscode.png)
+
+MD/JS Code is an example GEM application that you can download from the [releases page](https://github.com/neilrackett/md-js/releases) to edit and run JavaScript source code on your Atari ST.
 
 ## Hardware requirements
 

@@ -18,11 +18,12 @@
 /* JerryScript context lives in a statically-allocated BSS buffer so it doesn't
  * depend on newlib's malloc (which isn't safe to call from Core 1 on RP2040
  * before its lazy init has run on the calling core, and races with Core 0's
- * heap state). Size = jerry_context_t headroom + 48 KB heap.
+ * heap state). Size = jerry_context_t headroom + 32 KB heap.
  *
- * JerryScript 3.0's jerry_context_t can be a few KB depending on build flags,
- * so reserve 8 KB of headroom — plenty, and we still fit inside RAM. */
-#define JERRY_HEAP_BYTES (48u * 1024u)
+ * Reduced from 48 KB to 32 KB to make room for the lwIP/CYW43 network stack
+ * which is needed for fetch() support. JerryScript 3.0's jerry_context_t can
+ * be a few KB depending on build flags, so reserve 8 KB of headroom. */
+#define JERRY_HEAP_BYTES (32u * 1024u)
 #define JERRY_CONTEXT_HEADROOM (8u * 1024u)
 static uint8_t jerry_context_storage[JERRY_HEAP_BYTES + JERRY_CONTEXT_HEADROOM]
     __attribute__((aligned(8)));

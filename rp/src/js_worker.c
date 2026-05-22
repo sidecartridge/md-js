@@ -34,12 +34,22 @@
 #include "pico/multicore.h"
 #include "pico/time.h"
 
+#if !MDJS_NO_NETWORK
+#include "httpc/httpc.h"
+#include "pico/cyw43_arch.h"
+#include "js_fetch.h"
+#endif
+
 /* ── Linker symbol for ROM-in-RAM base (defined in memmap_rp.ld) ────────── */
 extern unsigned int __rom_in_ram_start__;
 
 /* ── Shared state ────────────────────────────────────────────────────────── */
-static JsWorkerMsgBlock s_msg;
-static spin_lock_t     *s_spin_lock;
+JsWorkerMsgBlock js_worker_msg;
+spin_lock_t     *js_worker_spin_lock;
+
+/* Internal shorthands */
+#define s_msg        js_worker_msg
+#define s_spin_lock  js_worker_spin_lock
 
 /* Cached addresses (set in js_worker_init, read-only thereafter) */
 static uint32_t s_rom_base;
@@ -130,6 +140,9 @@ static void core1_entry(void) {
   *s_ready_mem = 0;
   s_core1_phase = C1_PHASE_PRE_INIT;
   jerry_init(JERRY_INIT_EMPTY);
+#if !MDJS_NO_NETWORK
+  js_fetch_init();
+#endif
   s_core1_phase = C1_PHASE_POST_INIT;
   s_core1_initialised = true;
   *s_ready_mem = MDJS_READY_WORD;
@@ -320,8 +333,33 @@ static void core1_handle_call(void) {
   if (jerry_value_is_exception(ret)) {
     js_copy_exception_string(ret, s_core1_result_json,
                              sizeof(s_core1_result_json));
+    jerry_value_free(ret);
     result_is_error = true;
-  } else {
+    goto write_result;
+  }
+
+  /* If the function returned a Promise (e.g. async function), drain the
+   * microtask queue so all awaited continuations run to completion, then
+   * extract the settled value. */
+  if (jerry_value_is_promise(ret)) {
+    jerry_value_t jobs_result = jerry_run_jobs();
+    jerry_value_free(jobs_result);
+
+    jerry_promise_state_t state = jerry_promise_state(ret);
+    jerry_value_t settled = jerry_promise_result(ret);
+    jerry_value_free(ret);
+
+    if (state == JERRY_PROMISE_STATE_REJECTED) {
+      js_copy_exception_string(settled, s_core1_result_json,
+                               sizeof(s_core1_result_json));
+      jerry_value_free(settled);
+      result_is_error = true;
+      goto write_result;
+    }
+    ret = settled; /* fall through to JSON stringify below */
+  }
+
+  {
     jerry_value_t json_str = jerry_json_stringify(ret);
     jerry_value_free(ret);
     if (jerry_value_is_exception(json_str) || !jerry_value_is_string(json_str)) {
@@ -378,6 +416,9 @@ static void core1_handle_reset(void) {
   *s_ready_mem = 0;
   jerry_cleanup();
   jerry_init(JERRY_INIT_EMPTY);
+#if !MDJS_NO_NETWORK
+  js_fetch_init();
+#endif
   *s_ready_mem = MDJS_READY_WORD;
 
   uint32_t save = spin_lock_blocking(s_spin_lock);
@@ -437,6 +478,92 @@ static void js_send_response(uint32_t random_token) {
   TPROTO_SET_RANDOM_TOKEN(s_token_seed_addr, new_seed);
 }
 
+#if !MDJS_NO_NETWORK
+/* Recv callback — appends pbuf body data into s_msg.fetch_body. */
+static err_t js_fetch_recv_cb(void *arg, struct altcp_pcb *pcb,
+                              struct pbuf *p, err_t err) {
+  (void)pcb; (void)err; (void)arg;
+  if (!p) return ERR_OK;
+  size_t cur_len = strlen(s_msg.fetch_body);
+  struct pbuf *q = p;
+  while (q && cur_len < sizeof(s_msg.fetch_body) - 1) {
+    size_t copy = q->len;
+    if (cur_len + copy > sizeof(s_msg.fetch_body) - 1)
+      copy = sizeof(s_msg.fetch_body) - 1 - cur_len;
+    memcpy(s_msg.fetch_body + cur_len, q->payload, copy);
+    cur_len += copy;
+    q = q->next;
+  }
+  s_msg.fetch_body[cur_len] = '\0';
+  pbuf_free(p);
+  return ERR_OK;
+}
+
+/* Called on Core 0 when FIFO_MSG_FETCH_REQ arrives.
+   Performs a blocking HTTP GET and replies via FIFO_MSG_FETCH_OK/ERR. */
+static void js_handle_fetch_request(void) {
+  char url_copy[sizeof(s_msg.fetch_url)];
+  uint32_t save = spin_lock_blocking(s_spin_lock);
+  memcpy(url_copy, s_msg.fetch_url, sizeof(url_copy));
+  memset(s_msg.fetch_body, 0, sizeof(s_msg.fetch_body));
+  s_msg.fetch_status = 0;
+  s_msg.fetch_ok = false;
+  spin_unlock(s_spin_lock, save);
+
+  /* Require http:// — no HTTPS in v1 */
+  const char *host_start = url_copy;
+  if (strncmp(host_start, "http://", 7) != 0) {
+    multicore_fifo_push_blocking((uint32_t)FIFO_MSG_FETCH_ERR << FIFO_TAG_SHIFT);
+    return;
+  }
+  host_start += 7;
+
+  char hostname[128] = {0};
+  char path[128]     = "/";
+  uint16_t port      = 80;
+
+  const char *slash = strchr(host_start, '/');
+  size_t host_len = slash ? (size_t)(slash - host_start) : strlen(host_start);
+  if (host_len >= sizeof(hostname)) host_len = sizeof(hostname) - 1;
+  memcpy(hostname, host_start, host_len);
+  if (slash) {
+    size_t path_len = strlen(slash);
+    if (path_len >= sizeof(path)) path_len = sizeof(path) - 1;
+    memcpy(path, slash, path_len);
+    path[path_len] = '\0';
+  }
+
+  char *colon = strchr(hostname, ':');
+  if (colon) { port = (uint16_t)atoi(colon + 1); *colon = '\0'; }
+
+  HTTPC_REQUEST_T req;
+  memset(&req, 0, sizeof(req));
+  req.hostname = hostname;
+  req.url      = path;
+  req.port     = port;
+  req.recv_fn  = js_fetch_recv_cb;
+
+  int rc = http_client_request_sync(cyw43_arch_async_context(), &req);
+
+  save = spin_lock_blocking(s_spin_lock);
+  s_msg.fetch_ok         = (rc == 0 && req.result == HTTPC_RESULT_OK);
+  s_msg.fetch_status     = s_msg.fetch_ok ? 200 : 0;
+  s_msg.fetch_redirected = false;
+  strncpy(s_msg.fetch_status_text,
+          s_msg.fetch_ok ? "OK" : "",
+          sizeof(s_msg.fetch_status_text) - 1);
+  s_msg.fetch_status_text[sizeof(s_msg.fetch_status_text) - 1] = '\0';
+  spin_unlock(s_spin_lock, save);
+
+  DPRINTF("js_fetch: rc=%d ok=%d body_len=%u\n",
+          rc, (int)s_msg.fetch_ok, (unsigned)strlen(s_msg.fetch_body));
+
+  multicore_fifo_push_blocking(
+      (uint32_t)(s_msg.fetch_ok ? FIFO_MSG_FETCH_OK : FIFO_MSG_FETCH_ERR)
+      << FIFO_TAG_SHIFT);
+}
+#endif /* !MDJS_NO_NETWORK */
+
 /**
  * Wait for Core 1 to finish, with timeout recovery.
  * Returns the FIFO message tag, or FIFO_MSG_ERROR on timeout.
@@ -445,33 +572,44 @@ static void js_send_response(uint32_t random_token) {
  * a work request to Core 1. After the FIFO reply arrives, this function
  * waits briefly for s_flush_seq to advance past pre_seq — guarding against
  * a result flush whose final bus writes haven't propagated yet.
+ *
+ * While waiting, services any FIFO_MSG_FETCH_REQ messages from Core 1
+ * (network calls must run on Core 0 which owns the lwIP async context).
  */
 static uint8_t js_wait_for_core1(uint32_t pre_seq) {
-  uint32_t resp = 0;
-  bool     ok   = multicore_fifo_pop_timeout_us(JS_CALL_TIMEOUT_US, &resp);
-  if (!ok) {
-    DPRINTF("js_worker: Core 1 timeout — resetting\n");
-    uint32_t save = spin_lock_blocking(s_spin_lock);
-    js_write_timeout_error();
-    spin_unlock(s_spin_lock, save);
-
-    /* Reset Core 1. jerry_cleanup() is called at the top of core1_entry()
-     * before re-init, so the old heap is always freed on restart. */
-    *s_ready_mem = 0;
-    multicore_reset_core1();
-    multicore_launch_core1(core1_entry);
-    return FIFO_MSG_ERROR;
+  absolute_time_t deadline = make_timeout_time_us(JS_CALL_TIMEOUT_US);
+  while (true) {
+    uint32_t resp = 0;
+    bool ok = multicore_fifo_pop_timeout_us(10000, &resp);
+    if (!ok) {
+      if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+        /* Timeout — reset Core 1 */
+        DPRINTF("js_worker: Core 1 timeout — resetting\n");
+        uint32_t save = spin_lock_blocking(s_spin_lock);
+        js_write_timeout_error();
+        spin_unlock(s_spin_lock, save);
+        *s_ready_mem = 0;
+        multicore_reset_core1();
+        multicore_launch_core1(core1_entry);
+        return FIFO_MSG_ERROR;
+      }
+      continue;
+    }
+    uint8_t tag = (uint8_t)((resp & FIFO_TAG_MASK) >> FIFO_TAG_SHIFT);
+#if !MDJS_NO_NETWORK
+    if (tag == FIFO_MSG_FETCH_REQ) {
+      js_handle_fetch_request();
+      continue;
+    }
+#endif
+    /* Terminal reply — wait briefly for flush counter to advance */
+    for (int i = 0; i < 10000; i++) {
+      if (s_flush_seq != pre_seq) break;
+      __asm volatile("nop");
+    }
+    __dmb();
+    return tag;
   }
-
-  /* Belt-and-braces: spin briefly until Core 1's flush counter has advanced
-   * past the pre-call snapshot. Bounded to ~1 ms total (10000 iterations of
-   * ~100 ns each on a 125 MHz Cortex-M0+). */
-  for (int i = 0; i < 10000; i++) {
-    if (s_flush_seq != pre_seq) break;
-    __asm volatile("nop");
-  }
-  __dmb();
-  return (uint8_t)((resp & FIFO_TAG_MASK) >> FIFO_TAG_SHIFT);
 }
 
 static void js_copy_exception_string(jerry_value_t exception_value,
@@ -572,7 +710,8 @@ static bool js_parse_call_payload(const uint8_t *payload, size_t payload_size) {
 
 /**
  * Drain the FIFO response from an in-progress async call, if any.
- * Called at the top of js_worker_loop() — never blocks.
+ * Called at the top of js_worker_loop() — never blocks unless servicing a
+ * FETCH_REQ from Core 1 (which requires a blocking HTTP round-trip).
  */
 static void __not_in_flash_func(js_drain_async_fifo)(void) {
   if (!s_async_pending) return;
@@ -592,7 +731,20 @@ static void __not_in_flash_func(js_drain_async_fifo)(void) {
 
   /* Non-blocking: only drain if Core 1 has already pushed a response */
   if (!multicore_fifo_rvalid()) return;
-  multicore_fifo_pop_blocking(); /* discard tag — status already written by Core 1 */
+  uint32_t resp = multicore_fifo_pop_blocking();
+  uint8_t tag = (uint8_t)((resp & FIFO_TAG_MASK) >> FIFO_TAG_SHIFT);
+
+#if !MDJS_NO_NETWORK
+  /* During an async call Core 1 may request a fetch — service it on Core 0
+   * (which owns the lwIP async context) and stay pending until the real
+   * completion tag arrives. */
+  if (tag == FIFO_MSG_FETCH_REQ) {
+    js_handle_fetch_request();
+    return;
+  }
+#endif
+
+  /* Terminal reply — status already written by Core 1 in core1_flush_result. */
   s_async_pending = false;
 }
 
@@ -673,12 +825,16 @@ static void js_dispatch_command(const TransmissionProtocol *proto) {
       /* The protocol parser stores each 16-bit bus word with little-endian
        * layout (ARM strh), but the m68k transmitted the bytes in big-endian
        * order (byte0 in high half of the word). Un-swap pairs while copying
-       * so JerryScript sees the original source text. Demo sources are even
-       * length; odd-length chunks aren't supported yet — round down. */
+       * so JerryScript sees the original source text. For odd-length chunks
+       * the final byte sits in the high byte of the last word (index [1] in
+       * little-endian ARM storage); copy it explicitly after the block. */
       {
         size_t even_size = (size_t)chunk_size & ~(size_t)1u;
-        COPY_AND_CHANGE_ENDIANESS_BLOCK16(
-            data, s_msg.js_source + s_msg.js_source_len, even_size);
+        uint8_t *dst = s_msg.js_source + s_msg.js_source_len;
+        COPY_AND_CHANGE_ENDIANESS_BLOCK16(data, dst, even_size);
+        if (chunk_size & 1u) {
+          dst[even_size] = data[even_size + 1]; /* high byte of last word */
+        }
       }
       s_msg.js_source_len += chunk_size;
       s_msg.chunks_received++;

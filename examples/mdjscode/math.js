@@ -1,3 +1,10 @@
+/**
+ * math.js — basic maths functions example for MD/JS Code
+ *
+ * Demonstrates arithmetic, rounding and clamping using JS Math methods.
+ * Run with any function name and appropriate numeric parameters.
+ */
+
 function add(a, b) {
   return a + b;
 }

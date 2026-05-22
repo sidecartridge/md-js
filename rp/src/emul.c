@@ -15,6 +15,10 @@
 #include "romemul.h"
 #include "target_firmware.h"
 
+#if !MDJS_NO_NETWORK
+#include "network.h"
+#endif
+
 #define SLEEP_LOOP_MS 10
 
 void emul_start(void) {
@@ -23,6 +27,12 @@ void emul_start(void) {
 
   /* Serve cartridge bus requests using the protocol-only DMA lookup handler. */
   init_romemul(NULL, mdjs_dma_irq_handler_lookup, false);
+
+#if !MDJS_NO_NETWORK
+  /* Initialise WiFi in STA mode and connect using credentials from config. */
+  network_wifiInit(WIFI_MODE_STA);
+  network_wifiStaConnect();
+#endif
 
   /* Launch Core 1 JerryScript worker. */
   js_worker_init();

@@ -30,7 +30,7 @@ SCREEN_SIZE			equ (-4096)	; Use the memory before the screen memory to store the
 RANDOM_TOKEN_ADDR:        equ (ROM4_ADDR + $F000) 	      ; Random token address at $FAF000
 RANDOM_TOKEN_SEED_ADDR:   equ (RANDOM_TOKEN_ADDR + 4) 	  ; RANDOM_TOKEN_ADDR + 4 bytes
 RANDOM_TOKEN_POST_WAIT:   equ $1        		      	  ; Wait this cycles after the random number generator is ready
-COMMAND_TIMEOUT           equ $0000FFFF                   ; Timeout for the command
+COMMAND_TIMEOUT           equ $00800000                   ; Timeout for the command (~69s on 8MHz 68000)
 MDJS_READY_ADDR           equ (ROM4_ADDR + $F00A)         ; Worker-ready byte written by RP2040
 MDJS_READY_MAGIC          equ $4A                         ; Must match MDJS_READY_MAGIC in mdjs_protocol.h
 MDJS_BOOT_READY_TIMEOUT   equ 250                         ; VBL polls before reporting not detected
@@ -551,7 +551,7 @@ mdjsdemo_upload_source_end:
 MDJS_UPLOAD_SOURCE_LEN	equ (mdjsdemo_upload_source_end - mdjsdemo_upload_source)
 
 mdjsdemo_alert_suffix:
-	dc.b "][OK]",0
+	dc.b "| |For better MD/JS examples go to|github.com/neilrackett/md-js][OK]",0
 
 mdjsdemo_alert_worker_missing:
 	dc.b "[1][MD/JS worker not detected.][OK]",0
@@ -571,7 +571,7 @@ mdjsdemo_noaes_msg:
 	even
 
 mdjsdemo_alert_buffer:
-	ds.b 128
+	ds.b 192
 	even
 
 ; Writable call payload buffer: "add\0[a,b]\0" — 10 bytes is enough, but pad for safety.

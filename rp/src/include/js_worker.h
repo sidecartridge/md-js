@@ -76,12 +76,15 @@
 #define FIFO_TAG_SHIFT 24
 #define FIFO_TAG_MASK  0xFF000000u
 
-#define FIFO_MSG_PING   0x01u  /* Core 0 → Core 1: ping                     */
-#define FIFO_MSG_UPLOAD 0x02u  /* Core 0 → Core 1: eval assembled JS source */
-#define FIFO_MSG_CALL   0x03u  /* Core 0 → Core 1: call named function      */
-#define FIFO_MSG_RESET  0x04u  /* Core 0 → Core 1: wipe context             */
-#define FIFO_MSG_DONE   0x80u  /* Core 1 → Core 0: result ready (success)   */
-#define FIFO_MSG_ERROR  0x81u  /* Core 1 → Core 0: result ready (error)     */
+#define FIFO_MSG_PING      0x01u  /* Core 0 → Core 1: ping                     */
+#define FIFO_MSG_UPLOAD    0x02u  /* Core 0 → Core 1: eval assembled JS source */
+#define FIFO_MSG_CALL      0x03u  /* Core 0 → Core 1: call named function      */
+#define FIFO_MSG_RESET     0x04u  /* Core 0 → Core 1: wipe context             */
+#define FIFO_MSG_FETCH_REQ 0x05u  /* Core 1 → Core 0: perform HTTP fetch       */
+#define FIFO_MSG_DONE      0x80u  /* Core 1 → Core 0: result ready (success)   */
+#define FIFO_MSG_ERROR     0x81u  /* Core 1 → Core 0: result ready (error)     */
+#define FIFO_MSG_FETCH_OK  0x82u  /* Core 0 → Core 1: fetch succeeded          */
+#define FIFO_MSG_FETCH_ERR 0x83u  /* Core 0 → Core 1: fetch failed             */
 
 /* ── Spin-lock ──────────────────────────────────────────────────────────── */
 /* User-available range is 0–15; SDK uses 16–31.                            */
@@ -89,7 +92,7 @@
 
 /* ── JS execution timeout ───────────────────────────────────────────────── */
 /* Core 0 waits at most this long for Core 1 to reply before resetting it.  */
-#define JS_CALL_TIMEOUT_US 5000000  /* 5 seconds */
+#define JS_CALL_TIMEOUT_US 10000000  /* 10 seconds */
 
 /* ── Shared message block ───────────────────────────────────────────────── */
 /* Lives in Core 0 BSS. Core 1 reads/writes it under spin-lock 14.         */
@@ -107,7 +110,20 @@ typedef struct {
   /* Result (written by Core 1, flushed to ROM-in-RAM) */
   char result_json[JS_RESULT_MAX_SIZE];
   bool result_is_error;
+
+  /* fetch() request/response — Core 1 writes URL fields, Core 0 fills body */
+  char fetch_url[256];          /* full URL e.g. "http://host/path"           */
+  char fetch_body[4096];        /* response body (NUL-terminated)             */
+  char fetch_status_text[32];   /* HTTP reason phrase e.g. "OK", "Not Found"  */
+  uint16_t fetch_status;        /* HTTP status code (e.g. 200)                */
+  bool fetch_ok;                /* true if request succeeded and status 2xx   */
+  bool fetch_redirected;        /* true if the request followed a redirect    */
 } JsWorkerMsgBlock;
+
+/* ── Shared state (accessible to js_fetch.c) ────────────────────────────── */
+#include "hardware/sync.h"
+extern JsWorkerMsgBlock js_worker_msg;
+extern spin_lock_t     *js_worker_spin_lock;
 
 /* ── Public API (called from Core 0 / emul.c) ───────────────────────────── */
 

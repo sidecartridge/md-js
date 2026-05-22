@@ -84,9 +84,8 @@ set(CMAKE_C_STANDARD 11)
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
 
-# Disable network stack to conserve SRAM for JerryScript heap.
-# Set to 0 or remove if WiFi is needed alongside MD/JS.
-set(MDJS_NO_NETWORK 1)
+# Set to 1 to disable the network stack and preserve SRAM for JerryScript.
+set(MDJS_NO_NETWORK 0)
 
 add_subdirectory(settings)
 
@@ -98,7 +97,7 @@ endif()
 # ── JerryScript ─────────────────────────────────────────────────────────────
 get_filename_component(JERRYSCRIPT_PATH "${REPO_ROOT}/lib/jerryscript" REALPATH)
 
-set(JERRY_GLOBAL_HEAP_SIZE   48      CACHE STRING "" FORCE)
+set(JERRY_GLOBAL_HEAP_SIZE   32      CACHE STRING "" FORCE)
 set(JERRY_EXTERNAL_CONTEXT   ON      CACHE BOOL   "" FORCE)
 set(JERRY_PARSER             ON      CACHE BOOL   "" FORCE)
 set(JERRY_BUILTIN_JSON       ON      CACHE BOOL   "" FORCE)
@@ -151,6 +150,7 @@ target_sources(${PROJECT_NAME} PRIVATE
 if(NOT MDJS_NO_NETWORK)
     target_sources(${PROJECT_NAME} PRIVATE
         download.c
+        js_fetch.c
         network.c)
 endif()
 
@@ -277,9 +277,7 @@ add_definitions(-DDISPLAY_ATARIST)
 # We don't modify the flash in Core 1
 add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 
-# Disable network stack to conserve SRAM for JerryScript heap
-# Remove this definition if WiFi is needed alongside MD/JS
-add_definitions(-DMDJS_NO_NETWORK=1)
+add_definitions(-DMDJS_NO_NETWORK=${MDJS_NO_NETWORK})
 
 # Select HTTPS or HTTP downloads of the firmware
 add_definitions(-DAPP_DOWNLOAD_HTTPS=0)

@@ -30,6 +30,7 @@ static short result_win = -1;
 static short quit_requested = 0;
 static short result_top_line = 0;
 static short result_left_col = 0;
+static short async_call_pending = 0;
 
 /* TexEdit for the Code window — declared static because it's ~52 KB */
 static TexEdit code_te;
@@ -39,17 +40,18 @@ static const char *const initial_code_lines[] = {
     "}", "", "/* Edit me! */"};
 #define INITIAL_CODE_LINE_COUNT 5
 
-static char current_result[256] = "";
+static char current_result[2048] = "";
 
 static char about_button_label[] = "About";
+static char new_button_label[] = "New";
 static char load_button_label[] = "Load";
 static char save_button_label[] = "Save";
 static char run_button_label[] = "Run";
-static char quit_button_label[] = "Quit";
+static char quit_button_label[] = "\x05";
 
 /* Shared file selector state — remembers last directory across Load/Save */
 static char fsel_path[128] = "";
-static char fsel_file[13]  = "";
+static char fsel_file[13] = "";
 
 #define FUNC_LEN 32
 #define ARGS_LEN 32
@@ -66,14 +68,20 @@ enum {
   DL_FUNC_INPUT,
   DL_ARGS_LABEL,
   DL_ARGS_INPUT,
+  DL_ASYNC_LABEL,
+  DL_ASYNC_YES,
+  DL_ASYNC_NO,
   DL_OK,
   DL_CANCEL
 };
 
-#define DL_COUNT 7
+#define DL_COUNT 10
 
 static char d_func_label[] = "Function name";
 static char d_args_label[] = "Parameters (JSON)";
+static char d_async_label[] = "Run async?";
+static char d_async_yes[] = "Yes";
+static char d_async_no[] = "No";
 static char d_ok[] = "OK";
 static char d_cancel[] = "Cancel";
 
@@ -89,8 +97,11 @@ static short line_height(void) {
   return h;
 }
 
+#define DISPLAY_LINE_WIDTH 159
+
 static short count_text_lines(const char *text) {
-  short lines = 1;
+  short lines = 0;
+  short cols = 0;
 
   if (!text || !text[0]) {
     return 1;
@@ -99,9 +110,17 @@ static short count_text_lines(const char *text) {
   while (*text) {
     if (*text == '\n') {
       lines++;
+      cols = 0;
+    } else {
+      cols++;
+      if (cols == DISPLAY_LINE_WIDTH) {
+        lines++;
+        cols = 0;
+      }
     }
     text++;
   }
+  lines++; /* count the last (unterminated) segment */
 
   return lines;
 }
@@ -116,19 +135,20 @@ static short max_text_columns(const char *text) {
 
   while (*text) {
     if (*text == '\n') {
-      if (cols > max_cols) {
-        max_cols = cols;
-      }
+      if (cols > max_cols) max_cols = cols;
       cols = 0;
     } else {
       cols++;
+      if (cols == DISPLAY_LINE_WIDTH) {
+        if (cols > max_cols) max_cols = cols;
+        cols = 0;
+      }
     }
     text++;
   }
 
-  if (cols > max_cols) {
-    max_cols = cols;
-  }
+  if (cols > max_cols) max_cols = cols;
+  if (max_cols > DISPLAY_LINE_WIDTH) max_cols = DISPLAY_LINE_WIDTH;
 
   return max_cols;
 }
@@ -223,6 +243,7 @@ static void redraw_all(void);
 static void focus_result_window(void);
 static void present_result_window(void);
 static void fsel_init_path(void);
+static void poll_async_result(void);
 
 static void set_result_text(const char *text) {
   if (!text || !text[0]) {
@@ -236,7 +257,7 @@ static void set_result_text(const char *text) {
 }
 
 static void set_result_error_with_fallback(const char *fallback) {
-  char buf[256];
+  char buf[2048];
 
   buf[0] = '\0';
   if (mdjs_result(buf, (int)sizeof(buf)) == 0 && buf[0] != '\0') {
@@ -312,9 +333,11 @@ static void build_dialog(void) {
      3  (blank line)
      4  "Parameters (JSON):" label
      5  args input
-     6  top margin before buttons
-     7  buttons
-     8  bottom margin              => total height 9 */
+     6  (blank line)
+     7  Run async checkbox
+     8  (margin)
+     9  buttons
+    10  bottom margin             => total height 11 */
 
   dialog_tree[DL_ROOT].ob_next = -1;
   dialog_tree[DL_ROOT].ob_head = DL_FUNC_LABEL;
@@ -326,7 +349,7 @@ static void build_dialog(void) {
   dialog_tree[DL_ROOT].ob_x = 0;
   dialog_tree[DL_ROOT].ob_y = 0;
   dialog_tree[DL_ROOT].ob_width = dlg_w;
-  dialog_tree[DL_ROOT].ob_height = 9;
+  dialog_tree[DL_ROOT].ob_height = 11;
 
   dialog_tree[DL_FUNC_LABEL].ob_next = DL_FUNC_INPUT;
   dialog_tree[DL_FUNC_LABEL].ob_head = -1;
@@ -364,7 +387,7 @@ static void build_dialog(void) {
   dialog_tree[DL_ARGS_LABEL].ob_width = args_label_w;
   dialog_tree[DL_ARGS_LABEL].ob_height = 1;
 
-  dialog_tree[DL_ARGS_INPUT].ob_next = DL_OK;
+  dialog_tree[DL_ARGS_INPUT].ob_next = DL_ASYNC_LABEL;
   dialog_tree[DL_ARGS_INPUT].ob_head = -1;
   dialog_tree[DL_ARGS_INPUT].ob_tail = -1;
   dialog_tree[DL_ARGS_INPUT].ob_type = G_FTEXT;
@@ -376,6 +399,50 @@ static void build_dialog(void) {
   dialog_tree[DL_ARGS_INPUT].ob_width = input_w;
   dialog_tree[DL_ARGS_INPUT].ob_height = 1;
 
+  {
+    short async_label_w = (short)strlen(d_async_label);
+    short yes_w = (short)((short)strlen(d_async_yes) + 4);
+    short no_w = (short)((short)strlen(d_async_no) + 4);
+    short yes_x = (short)(2 + async_label_w + 2);
+    short no_x = (short)(yes_x + yes_w + 1);
+
+    dialog_tree[DL_ASYNC_LABEL].ob_next = DL_ASYNC_YES;
+    dialog_tree[DL_ASYNC_LABEL].ob_head = -1;
+    dialog_tree[DL_ASYNC_LABEL].ob_tail = -1;
+    dialog_tree[DL_ASYNC_LABEL].ob_type = G_STRING;
+    dialog_tree[DL_ASYNC_LABEL].ob_flags = OF_NONE;
+    dialog_tree[DL_ASYNC_LABEL].ob_state = OS_NORMAL;
+    dialog_tree[DL_ASYNC_LABEL].ob_spec.free_string = d_async_label;
+    dialog_tree[DL_ASYNC_LABEL].ob_x = 2;
+    dialog_tree[DL_ASYNC_LABEL].ob_y = 7;
+    dialog_tree[DL_ASYNC_LABEL].ob_width = async_label_w;
+    dialog_tree[DL_ASYNC_LABEL].ob_height = 1;
+
+    dialog_tree[DL_ASYNC_YES].ob_next = DL_ASYNC_NO;
+    dialog_tree[DL_ASYNC_YES].ob_head = -1;
+    dialog_tree[DL_ASYNC_YES].ob_tail = -1;
+    dialog_tree[DL_ASYNC_YES].ob_type = G_BUTTON;
+    dialog_tree[DL_ASYNC_YES].ob_flags = OF_SELECTABLE | OF_RBUTTON;
+    dialog_tree[DL_ASYNC_YES].ob_state = OS_NORMAL;
+    dialog_tree[DL_ASYNC_YES].ob_spec.free_string = d_async_yes;
+    dialog_tree[DL_ASYNC_YES].ob_x = yes_x;
+    dialog_tree[DL_ASYNC_YES].ob_y = 7;
+    dialog_tree[DL_ASYNC_YES].ob_width = yes_w;
+    dialog_tree[DL_ASYNC_YES].ob_height = 1;
+
+    dialog_tree[DL_ASYNC_NO].ob_next = DL_OK;
+    dialog_tree[DL_ASYNC_NO].ob_head = -1;
+    dialog_tree[DL_ASYNC_NO].ob_tail = -1;
+    dialog_tree[DL_ASYNC_NO].ob_type = G_BUTTON;
+    dialog_tree[DL_ASYNC_NO].ob_flags = OF_SELECTABLE | OF_RBUTTON;
+    dialog_tree[DL_ASYNC_NO].ob_state = OS_SELECTED;
+    dialog_tree[DL_ASYNC_NO].ob_spec.free_string = d_async_no;
+    dialog_tree[DL_ASYNC_NO].ob_x = no_x;
+    dialog_tree[DL_ASYNC_NO].ob_y = 7;
+    dialog_tree[DL_ASYNC_NO].ob_width = no_w;
+    dialog_tree[DL_ASYNC_NO].ob_height = 1;
+  }
+
   dialog_tree[DL_OK].ob_next = DL_CANCEL;
   dialog_tree[DL_OK].ob_head = -1;
   dialog_tree[DL_OK].ob_tail = -1;
@@ -384,7 +451,7 @@ static void build_dialog(void) {
   dialog_tree[DL_OK].ob_state = OS_NORMAL;
   dialog_tree[DL_OK].ob_spec.free_string = d_ok;
   dialog_tree[DL_OK].ob_x = 2;
-  dialog_tree[DL_OK].ob_y = 7;
+  dialog_tree[DL_OK].ob_y = 9;
   dialog_tree[DL_OK].ob_width = btn_w;
   dialog_tree[DL_OK].ob_height = 1;
 
@@ -396,7 +463,7 @@ static void build_dialog(void) {
   dialog_tree[DL_CANCEL].ob_state = OS_NORMAL;
   dialog_tree[DL_CANCEL].ob_spec.free_string = d_cancel;
   dialog_tree[DL_CANCEL].ob_x = (short)(dlg_w - btn_w - 2);
-  dialog_tree[DL_CANCEL].ob_y = 7;
+  dialog_tree[DL_CANCEL].ob_y = 9;
   dialog_tree[DL_CANCEL].ob_width = btn_w;
   dialog_tree[DL_CANCEL].ob_height = 1;
 
@@ -476,12 +543,13 @@ static void open_windows(void) {
 }
 
 static void get_toolbar_layout(short *about_x, short *about_y, short *about_w,
-                               short *about_h, short *load_x, short *load_y,
-                               short *load_w, short *load_h, short *save_x,
-                               short *save_y, short *save_w, short *save_h,
-                               short *run_x, short *run_y, short *run_w,
-                               short *run_h, short *quit_x, short *quit_y,
-                               short *quit_w, short *quit_h) {
+                               short *about_h, short *new_x, short *new_y,
+                               short *new_w, short *new_h, short *load_x,
+                               short *load_y, short *load_w, short *load_h,
+                               short *save_x, short *save_y, short *save_w,
+                               short *save_h, short *run_x, short *run_y,
+                               short *run_w, short *run_h, short *quit_x,
+                               short *quit_y, short *quit_w, short *quit_h) {
   short wx, wy, ww, wh;
   short btn_h;
   short btn_y;
@@ -499,7 +567,12 @@ static void get_toolbar_layout(short *about_x, short *about_y, short *about_w,
   *about_w = (short)((short)strlen(about_button_label) * sys_char_w + 14);
   *about_h = btn_h;
 
-  *load_x = (short)(*about_x + *about_w + 8);
+  *new_x = (short)(*about_x + *about_w + 8);
+  *new_y = btn_y;
+  *new_w = (short)((short)strlen(new_button_label) * sys_char_w + 14);
+  *new_h = btn_h;
+
+  *load_x = (short)(*new_x + *new_w + 8);
   *load_y = btn_y;
   *load_w = (short)((short)strlen(load_button_label) * sys_char_w + 14);
   *load_h = btn_h;
@@ -574,6 +647,30 @@ static void draw_button(short x, short y, short w, short h, const char *label) {
   v_gtext(aes_handle, text_x, text_y, (char *)label);
 }
 
+static void draw_button_plain(short x, short y, short w, short h,
+                              const char *label) {
+  short fill[4];
+  short text_x;
+  short text_y;
+
+  fill[0] = x;
+  fill[1] = y;
+  fill[2] = (short)(x + w - 1);
+  fill[3] = (short)(y + h - 1);
+
+  vswr_mode(aes_handle, MD_REPLACE);
+  vsf_color(aes_handle, 0);
+  vsf_interior(aes_handle, FIS_SOLID);
+  vsf_perimeter(aes_handle, 0);
+  vr_recfl(aes_handle, fill);
+
+  text_x = (short)(x + ((w - ((short)strlen(label) * sys_char_w)) / 2));
+  text_y = (short)(y + (h + sys_char_h * 3 / 4) / 2);
+  vst_effects(aes_handle, 0);
+  vst_color(aes_handle, 1);
+  v_gtext(aes_handle, text_x, text_y, (char *)label);
+}
+
 static void draw_multiline_text(const char *text, short left, short top,
                                 short bottom, short first_line,
                                 short first_col) {
@@ -593,33 +690,45 @@ static void draw_multiline_text(const char *text, short left, short top,
     const char *p = text;
     while (*p && line_y + sys_char_h <= bottom) {
       const char *eol = p;
-      short len;
+      short total_len;
 
       while (*eol && *eol != '\n') {
         eol++;
       }
-      len = (short)(eol - p);
-      if (len > (short)(sizeof(line_buf) - 1)) {
-        len = (short)(sizeof(line_buf) - 1);
+      total_len = (short)(eol - p);
+
+      /* Wrap long logical lines into multiple visual rows of line_buf width. */
+      {
+        short wrap_w = (short)(sizeof(line_buf) - 1);
+        short seg_start = 0;
+        do {
+          short seg_len = (short)(total_len - seg_start);
+          if (seg_len > wrap_w) seg_len = wrap_w;
+
+          if (current_line >= first_line && line_y + sys_char_h <= bottom) {
+            short copy_start = first_col;
+            short copy_len = seg_len;
+            if (copy_start > copy_len) copy_start = copy_len;
+            copy_len = (short)(copy_len - copy_start);
+            memcpy(line_buf, p + seg_start + copy_start, (size_t)copy_len);
+            line_buf[copy_len] = '\0';
+            v_gtext(aes_handle, left, line_y, line_buf);
+            line_y = (short)(line_y + line_h);
+          }
+          current_line++;
+          seg_start = (short)(seg_start + wrap_w);
+        } while (seg_start < total_len);
+
+        /* Ensure at least one visual row for empty lines. */
+        if (total_len == 0) {
+          if (current_line >= first_line && line_y + sys_char_h <= bottom) {
+            v_gtext(aes_handle, left, line_y, "");
+            line_y = (short)(line_y + line_h);
+          }
+          current_line++;
+        }
       }
 
-      if (current_line >= first_line) {
-        short copy_start = first_col;
-        short copy_len = len;
-
-        if (copy_start > copy_len) {
-          copy_start = copy_len;
-        }
-        copy_len = (short)(copy_len - copy_start);
-        if (copy_len > (short)(sizeof(line_buf) - 1)) {
-          copy_len = (short)(sizeof(line_buf) - 1);
-        }
-        memcpy(line_buf, p + copy_start, (size_t)copy_len);
-        line_buf[copy_len] = '\0';
-        v_gtext(aes_handle, left, line_y, line_buf);
-        line_y = (short)(line_y + line_h);
-      }
-      current_line++;
       if (*eol == '\0') {
         break;
       }
@@ -633,6 +742,7 @@ static void draw_multiline_text(const char *text, short left, short top,
 static void redraw_toolbar_window(void) {
   short clip_x, clip_y, clip_w, clip_h;
   short about_x, about_y, about_w, about_h;
+  short new_x, new_y, new_w, new_h;
   short load_x, load_y, load_w, load_h;
   short save_x, save_y, save_w, save_h;
   short run_x, run_y, run_w, run_h;
@@ -646,11 +756,10 @@ static void redraw_toolbar_window(void) {
   wind_update(BEG_UPDATE);
   graf_mouse(M_OFF, NULL);
 
-  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h,
-                     &load_x, &load_y, &load_w, &load_h,
-                     &save_x, &save_y, &save_w, &save_h,
-                     &run_x, &run_y, &run_w, &run_h,
-                     &quit_x, &quit_y, &quit_w, &quit_h);
+  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h, &new_x, &new_y,
+                     &new_w, &new_h, &load_x, &load_y, &load_w, &load_h,
+                     &save_x, &save_y, &save_w, &save_h, &run_x, &run_y,
+                     &run_w, &run_h, &quit_x, &quit_y, &quit_w, &quit_h);
 
   wind_get(toolbar_win, WF_FIRSTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
   while (clip_w > 0 && clip_h > 0) {
@@ -662,10 +771,11 @@ static void redraw_toolbar_window(void) {
     vs_clip(aes_handle, 1, clip);
     fill_clip_rect(clip_x, clip_y, clip_w, clip_h);
     draw_button(about_x, about_y, about_w, about_h, about_button_label);
+    draw_button(new_x, new_y, new_w, new_h, new_button_label);
     draw_button(load_x, load_y, load_w, load_h, load_button_label);
     draw_button(save_x, save_y, save_w, save_h, save_button_label);
     draw_button(run_x, run_y, run_w, run_h, run_button_label);
-    draw_button(quit_x, quit_y, quit_w, quit_h, quit_button_label);
+    draw_button_plain(quit_x, quit_y, quit_w, quit_h, quit_button_label);
     vs_clip(aes_handle, 0, clip);
 
     wind_get(toolbar_win, WF_NEXTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
@@ -730,7 +840,7 @@ static void do_redraw(short win) {
   }
 }
 
-static short run_dialog(void) {
+static short run_dialog(short *async_out) {
   short x, y, w, h;
   short exit_obj;
 
@@ -745,6 +855,11 @@ static short run_dialog(void) {
   objc_draw(dialog_tree, ROOT, MAX_DEPTH, x, y, w, h);
   exit_obj = (short)(form_do(dialog_tree, DL_FUNC_INPUT) & 0x7FFF);
   dialog_tree[exit_obj].ob_state &= ~OS_SELECTED;
+
+  if (async_out) {
+    *async_out =
+        (short)((dialog_tree[DL_ASYNC_YES].ob_state & OS_SELECTED) != 0);
+  }
 
   form_dial(FMD_SHRINK, x, y, w, h, 0, 0, 0, 0);
   form_dial(FMD_FINISH, x, y, w, h, 0, 0, 0, 0);
@@ -778,11 +893,12 @@ static void build_upload_buf(char *buf, int buflen) {
 
 static void do_run(void) {
   short err;
+  short async_mode = 0;
   char args_input[ARGS_LEN + 4];
-  char result[256];
+  char result[2048];
   static char upload_buf[TE_MAX_LINES * (TE_MAX_LINE_LEN + 1)];
 
-  if (!run_dialog()) {
+  if (!run_dialog(&async_mode)) {
     return;
   }
 
@@ -833,6 +949,20 @@ static void do_run(void) {
     if (dialog_func[0] == '\0') strcpy(dialog_func, "main");
   }
 
+  if (async_mode) {
+    err = (short)mdjs_call_async(dialog_func, args_input);
+    if (err != 0) {
+      set_result_error_with_fallback("Error: async call failed.");
+      present_result_window();
+      return;
+    }
+
+    set_result_text("Running code...");
+    present_result_window();
+    async_call_pending = 1;
+    return;
+  }
+
   err = (short)mdjs_call(dialog_func, args_input, result, (int)sizeof(result));
   if (err != 0) {
     set_result_error_with_fallback("Error: call failed.");
@@ -877,7 +1007,10 @@ static void do_save(void) {
   slash = save_path;
   {
     char *p = save_path;
-    while (*p) { if (*p == '\\') slash = p; p++; }
+    while (*p) {
+      if (*p == '\\') slash = p;
+      p++;
+    }
   }
   slash[1] = '\0';
   strcat(save_path, "*.JS");
@@ -899,7 +1032,10 @@ static void do_save(void) {
   slash = full;
   {
     char *p = full;
-    while (*p) { if (*p == '\\') slash = p; p++; }
+    while (*p) {
+      if (*p == '\\') slash = p;
+      p++;
+    }
   }
   slash[1] = '\0';
   strcat(full, save_file);
@@ -915,7 +1051,7 @@ static void do_save(void) {
     len = textedit_get_line(&code_te, r, line_buf, TE_MAX_LINE_LEN + 1);
     if (len < 0) len = 0;
     if (r < n - 1) {
-      line_buf[len]     = '\r';
+      line_buf[len] = '\r';
       line_buf[len + 1] = '\n';
       len += 2;
     }
@@ -944,7 +1080,7 @@ static void fsel_init_path(void) {
   Dgetpath(fsel_path + 3, (short)(drive + 1));
   len = (short)strlen(fsel_path);
   if (fsel_path[len - 1] != '\\') {
-    fsel_path[len]     = '\\';
+    fsel_path[len] = '\\';
     fsel_path[len + 1] = '\0';
   }
   strcat(fsel_path, "*.JS");
@@ -983,7 +1119,10 @@ static void do_load(void) {
     slash = full;
     {
       char *p = full;
-      while (*p) { if (*p == '\\') slash = p; p++; }
+      while (*p) {
+        if (*p == '\\') slash = p;
+        p++;
+      }
     }
     slash[1] = '\0';
     strcat(full, fsel_file);
@@ -997,7 +1136,8 @@ static void do_load(void) {
     file_size = Fseek(0L, (short)fh, 2);
     Fseek(0L, (short)fh, 0);
 
-    if (file_size <= 0 || file_size > (long)(TE_MAX_LINES * (TE_MAX_LINE_LEN + 1))) {
+    if (file_size <= 0 ||
+        file_size > (long)(TE_MAX_LINES * (TE_MAX_LINE_LEN + 1))) {
       form_alert(1, "[1][File is empty or too large.][OK]");
       Fclose((short)fh);
       return;
@@ -1125,22 +1265,37 @@ static void hslider_window(short win, const char *text, short *left_col,
   do_redraw(win);
 }
 
+static const char *const new_code_lines[] = {
+    "function main() {", "  /* Edit me! */", "}"};
+#define NEW_CODE_LINE_COUNT 3
+
+static void do_new(void) {
+  textedit_clear(&code_te);
+  code_te.num_lines = 0;
+  textedit_set_text(&code_te, new_code_lines, NEW_CODE_LINE_COUNT);
+  textedit_update_sliders(&code_te);
+  textedit_redraw_all(&code_te);
+}
+
 static void handle_toolbar_click(short mouse_x, short mouse_y) {
   short about_x, about_y, about_w, about_h;
+  short new_x, new_y, new_w, new_h;
   short load_x, load_y, load_w, load_h;
   short save_x, save_y, save_w, save_h;
   short run_x, run_y, run_w, run_h;
   short quit_x, quit_y, quit_w, quit_h;
 
-  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h,
-                     &load_x, &load_y, &load_w, &load_h,
-                     &save_x, &save_y, &save_w, &save_h,
-                     &run_x, &run_y, &run_w, &run_h,
-                     &quit_x, &quit_y, &quit_w, &quit_h);
+  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h, &new_x, &new_y,
+                     &new_w, &new_h, &load_x, &load_y, &load_w, &load_h,
+                     &save_x, &save_y, &save_w, &save_h, &run_x, &run_y,
+                     &run_w, &run_h, &quit_x, &quit_y, &quit_w, &quit_h);
 
   if (mouse_x >= about_x && mouse_x < about_x + about_w && mouse_y >= about_y &&
       mouse_y < about_y + about_h) {
     do_about();
+  } else if (mouse_x >= new_x && mouse_x < new_x + new_w &&
+             mouse_y >= new_y && mouse_y < new_y + new_h) {
+    do_new();
   } else if (mouse_x >= load_x && mouse_x < load_x + load_w &&
              mouse_y >= load_y && mouse_y < load_y + load_h) {
     do_load();
@@ -1194,6 +1349,25 @@ static void handle_code_arrowed(short direction) {
   textedit_redraw_all(&code_te);
 }
 
+static void poll_async_result(void) {
+  char result[2048];
+  unsigned char status;
+
+  if (!async_call_pending) return;
+
+  status = mdjs_status();
+  if (status == MDJS_STATUS_BUSY) return;
+
+  async_call_pending = 0;
+
+  if (mdjs_result(result, (int)sizeof(result)) != 0 || result[0] == '\0') {
+    set_result_text("Error: empty result.");
+  } else {
+    set_result_text(result);
+  }
+  present_result_window();
+}
+
 static void event_loop(void) {
   short ev;
   short msg[8];
@@ -1230,6 +1404,7 @@ static void event_loop(void) {
 
     if (ev & MU_TIMER) {
       textedit_blink(&code_te);
+      poll_async_result();
     }
 
     if (ev & MU_KEYBD) {

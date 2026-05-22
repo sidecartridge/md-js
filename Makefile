@@ -6,6 +6,8 @@ APP_UUID_KEY_RESOLVED := $(if $(strip $(APP_UUID_KEY)),$(strip $(APP_UUID_KEY)),
 UART_BAUD ?= 115200
 UART_DEV ?=
 
+export STCMD_NO_TTY = 1
+
 ## Build production firmware for pico_w using APP_UUID_KEY env var, then uuid.txt, then default
 .PHONY: build
 build:
