@@ -587,6 +587,36 @@ void textedit_update_sliders(TexEdit *te)
  * Input
  * ---------------------------------------------------------------------- */
 
+void textedit_click(TexEdit *te, int16_t mx, int16_t my)
+{
+    int16_t wx, wy, ww, wh;
+    int16_t sr, sc, br, bc;
+    TEDirty d;
+
+    te_get_work(te, &wx, &wy, &ww, &wh);
+
+    sr = (te->cell_h > 0) ? (my - wy) / te->cell_h : 0;
+    sc = (te->cell_w > 0) ? (mx - wx) / te->cell_w : 0;
+    if (sr < 0) sr = 0;
+    if (sc < 0) sc = 0;
+
+    br = te->vscroll + sr;
+    bc = te->hscroll + sc;
+
+    if (br >= te->num_lines) br = te->num_lines - 1;
+    if (br < 0) br = 0;
+    if (bc > te->line_len[br]) bc = te->line_len[br];
+
+    d.first = (te->cursor_row < br) ? te->cursor_row : br;
+    d.last  = (te->cursor_row > br) ? te->cursor_row : br;
+
+    te->cursor_row     = br;
+    te->cursor_col     = bc;
+    te->cursor_visible = 1;
+
+    textedit_finish_edit(te, d);
+}
+
 /* Apply a keycode to the buffer and cursor.
    Returns dirty range in absolute buffer rows; first > last means unhandled. */
 TEDirty textedit_apply_key(TexEdit *te, int16_t keycode)

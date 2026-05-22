@@ -64,6 +64,8 @@ typedef struct { int16_t first; int16_t last; } TEDirty;
     } while (0)
 
 /* --- Input --- */
+/* Move cursor to the buffer position nearest pixel (mx, my); redraws cursor. */
+void    textedit_click(TexEdit *te, int16_t mx, int16_t my);
 /* Apply keycode to buffer; returns dirty buffer-row range (first>last = unhandled). */
 TEDirty textedit_apply_key(TexEdit *te, int16_t keycode);
 /* Redraw dirty range, update sliders, ensure cursor visible. */

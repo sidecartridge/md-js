@@ -1219,6 +1219,12 @@ static void event_loop(void) {
           handle_toolbar_click(mx, my);
         }
       }
+      if (code_win >= 0) {
+        wind_get(code_win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+        if (mx >= wx && mx < wx + ww && my >= wy && my < wy + wh) {
+          textedit_click(&code_te, mx, my);
+        }
+      }
     }
     last_mb = mb;
 
