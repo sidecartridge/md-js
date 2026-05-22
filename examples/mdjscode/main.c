@@ -42,8 +42,14 @@ static const char *const initial_code_lines[] = {
 static char current_result[256] = "";
 
 static char about_button_label[] = "About";
+static char load_button_label[] = "Load";
+static char save_button_label[] = "Save";
 static char run_button_label[] = "Run";
 static char quit_button_label[] = "Quit";
+
+/* Shared file selector state — remembers last directory across Load/Save */
+static char fsel_path[128] = "";
+static char fsel_file[13]  = "";
 
 #define FUNC_LEN 32
 #define ARGS_LEN 32
@@ -216,6 +222,7 @@ static void update_window_sliders(short win, const char *text, short top_line,
 static void redraw_all(void);
 static void focus_result_window(void);
 static void present_result_window(void);
+static void fsel_init_path(void);
 
 static void set_result_text(const char *text) {
   if (!text || !text[0]) {
@@ -469,9 +476,12 @@ static void open_windows(void) {
 }
 
 static void get_toolbar_layout(short *about_x, short *about_y, short *about_w,
-                               short *about_h, short *run_x, short *run_y,
-                               short *run_w, short *run_h, short *quit_x,
-                               short *quit_y, short *quit_w, short *quit_h) {
+                               short *about_h, short *load_x, short *load_y,
+                               short *load_w, short *load_h, short *save_x,
+                               short *save_y, short *save_w, short *save_h,
+                               short *run_x, short *run_y, short *run_w,
+                               short *run_h, short *quit_x, short *quit_y,
+                               short *quit_w, short *quit_h) {
   short wx, wy, ww, wh;
   short btn_h;
   short btn_y;
@@ -489,7 +499,17 @@ static void get_toolbar_layout(short *about_x, short *about_y, short *about_w,
   *about_w = (short)((short)strlen(about_button_label) * sys_char_w + 14);
   *about_h = btn_h;
 
-  *run_x = (short)(*about_x + *about_w + 8);
+  *load_x = (short)(*about_x + *about_w + 8);
+  *load_y = btn_y;
+  *load_w = (short)((short)strlen(load_button_label) * sys_char_w + 14);
+  *load_h = btn_h;
+
+  *save_x = (short)(*load_x + *load_w + 8);
+  *save_y = btn_y;
+  *save_w = (short)((short)strlen(save_button_label) * sys_char_w + 14);
+  *save_h = btn_h;
+
+  *run_x = (short)(*save_x + *save_w + 8);
   *run_y = btn_y;
   *run_w = (short)((short)strlen(run_button_label) * sys_char_w + 14);
   *run_h = btn_h;
@@ -613,6 +633,8 @@ static void draw_multiline_text(const char *text, short left, short top,
 static void redraw_toolbar_window(void) {
   short clip_x, clip_y, clip_w, clip_h;
   short about_x, about_y, about_w, about_h;
+  short load_x, load_y, load_w, load_h;
+  short save_x, save_y, save_w, save_h;
   short run_x, run_y, run_w, run_h;
   short quit_x, quit_y, quit_w, quit_h;
   short clip[4];
@@ -624,8 +646,11 @@ static void redraw_toolbar_window(void) {
   wind_update(BEG_UPDATE);
   graf_mouse(M_OFF, NULL);
 
-  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h, &run_x, &run_y,
-                     &run_w, &run_h, &quit_x, &quit_y, &quit_w, &quit_h);
+  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h,
+                     &load_x, &load_y, &load_w, &load_h,
+                     &save_x, &save_y, &save_w, &save_h,
+                     &run_x, &run_y, &run_w, &run_h,
+                     &quit_x, &quit_y, &quit_w, &quit_h);
 
   wind_get(toolbar_win, WF_FIRSTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
   while (clip_w > 0 && clip_h > 0) {
@@ -637,6 +662,8 @@ static void redraw_toolbar_window(void) {
     vs_clip(aes_handle, 1, clip);
     fill_clip_rect(clip_x, clip_y, clip_w, clip_h);
     draw_button(about_x, about_y, about_w, about_h, about_button_label);
+    draw_button(load_x, load_y, load_w, load_h, load_button_label);
+    draw_button(save_x, save_y, save_w, save_h, save_button_label);
     draw_button(run_x, run_y, run_w, run_h, run_button_label);
     draw_button(quit_x, quit_y, quit_w, quit_h, quit_button_label);
     vs_clip(aes_handle, 0, clip);
@@ -833,6 +860,195 @@ static void do_about(void) {
   graf_mouse(ARROW, NULL);
 }
 
+static void do_save(void) {
+  short exit_btn;
+  char save_file[13] = "";
+  char save_path[128];
+  char full[128 + 13];
+  char *slash;
+  long fh;
+  static char line_buf[TE_MAX_LINE_LEN + 2];
+  short r, n, len;
+
+  fsel_init_path();
+
+  /* Build a save-path using the current fsel directory but no wildcard */
+  strcpy(save_path, fsel_path);
+  slash = save_path;
+  {
+    char *p = save_path;
+    while (*p) { if (*p == '\\') slash = p; p++; }
+  }
+  slash[1] = '\0';
+  strcat(save_path, "*.JS");
+
+  wind_update(BEG_UPDATE);
+  wind_update(BEG_MCTRL);
+  fsel_exinput(save_path, save_file, &exit_btn, "Save JavaScript file");
+  wind_update(END_MCTRL);
+  wind_update(END_UPDATE);
+  redraw_all();
+  graf_mouse(ARROW, NULL);
+
+  if (exit_btn != 1 || save_file[0] == '\0') {
+    return;
+  }
+
+  /* Build full path */
+  strcpy(full, save_path);
+  slash = full;
+  {
+    char *p = full;
+    while (*p) { if (*p == '\\') slash = p; p++; }
+  }
+  slash[1] = '\0';
+  strcat(full, save_file);
+
+  fh = Fcreate(full, 0);
+  if (fh < 0) {
+    form_alert(1, "[1][Could not create file.][OK]");
+    return;
+  }
+
+  n = textedit_get_line_count(&code_te);
+  for (r = 0; r < n; r++) {
+    len = textedit_get_line(&code_te, r, line_buf, TE_MAX_LINE_LEN + 1);
+    if (len < 0) len = 0;
+    if (r < n - 1) {
+      line_buf[len]     = '\r';
+      line_buf[len + 1] = '\n';
+      len += 2;
+    }
+    Fwrite((short)fh, (long)len, line_buf);
+  }
+
+  Fclose((short)fh);
+
+  /* Update shared fsel path to the saved directory */
+  {
+    short dirlen = (short)(slash - full + 1);
+    memcpy(fsel_path, full, dirlen);
+    strcpy(fsel_path + dirlen, "*.JS");
+  }
+}
+
+static void fsel_init_path(void) {
+  short drive, len;
+
+  if (fsel_path[0] != '\0') return;
+
+  drive = Dgetdrv();
+  fsel_path[0] = (char)('A' + drive);
+  fsel_path[1] = ':';
+  fsel_path[2] = '\\';
+  Dgetpath(fsel_path + 3, (short)(drive + 1));
+  len = (short)strlen(fsel_path);
+  if (fsel_path[len - 1] != '\\') {
+    fsel_path[len]     = '\\';
+    fsel_path[len + 1] = '\0';
+  }
+  strcat(fsel_path, "*.JS");
+}
+
+static void do_load(void) {
+  short exit_btn;
+
+  fsel_init_path();
+
+  wind_update(BEG_UPDATE);
+  wind_update(BEG_MCTRL);
+  fsel_exinput(fsel_path, fsel_file, &exit_btn, "Load JavaScript file");
+  wind_update(END_MCTRL);
+  wind_update(END_UPDATE);
+  redraw_all();
+  graf_mouse(ARROW, NULL);
+
+  if (exit_btn != 1 || fsel_file[0] == '\0') {
+    return;
+  }
+
+  {
+    /* Build full path: fsel_path ends at last backslash (or is bare drive),
+       append the filename returned in fsel_file. */
+    char full[128 + 13];
+    char *slash;
+    short len;
+    long fh;
+    long file_size;
+    char *buf;
+    static char line_buf[TE_MAX_LINE_LEN + 1];
+    long bytes_read;
+
+    strcpy(full, fsel_path);
+    slash = full;
+    {
+      char *p = full;
+      while (*p) { if (*p == '\\') slash = p; p++; }
+    }
+    slash[1] = '\0';
+    strcat(full, fsel_file);
+
+    fh = Fopen(full, 0);
+    if (fh < 0) {
+      form_alert(1, "[1][Could not open file.][OK]");
+      return;
+    }
+
+    file_size = Fseek(0L, (short)fh, 2);
+    Fseek(0L, (short)fh, 0);
+
+    if (file_size <= 0 || file_size > (long)(TE_MAX_LINES * (TE_MAX_LINE_LEN + 1))) {
+      form_alert(1, "[1][File is empty or too large.][OK]");
+      Fclose((short)fh);
+      return;
+    }
+
+    buf = (char *)Malloc(file_size + 1);
+    if (!buf) {
+      form_alert(1, "[1][Not enough memory.][OK]");
+      Fclose((short)fh);
+      return;
+    }
+
+    bytes_read = Fread((short)fh, file_size, buf);
+    Fclose((short)fh);
+    buf[bytes_read > 0 ? bytes_read : 0] = '\0';
+
+    /* Split on newlines and load into editor.
+       Zero num_lines directly so append_line fills from row 0 without
+       the ghost empty line that textedit_clear intentionally leaves. */
+    textedit_clear(&code_te);
+    code_te.num_lines = 0;
+    {
+      char *p = buf;
+      char *eol;
+      short line_len;
+
+      while (*p) {
+        eol = p;
+        while (*eol && *eol != '\n' && *eol != '\r') eol++;
+        line_len = (short)(eol - p);
+        if (line_len > TE_MAX_LINE_LEN) line_len = TE_MAX_LINE_LEN;
+        memcpy(line_buf, p, line_len);
+        line_buf[line_len] = '\0';
+        textedit_append_line(&code_te, line_buf);
+        if (*eol == '\r' && *(eol + 1) == '\n') eol++;
+        p = (*eol) ? eol + 1 : eol;
+      }
+    }
+
+    Mfree(buf);
+
+    /* Update the fsel path to point to the directory we just loaded from */
+    len = (short)(slash - full + 1);
+    memcpy(fsel_path, full, len);
+    strcpy(fsel_path + len, "*.JS");
+
+    textedit_update_sliders(&code_te);
+    textedit_redraw_all(&code_te);
+  }
+}
+
 static void scroll_window(short win, const char *text, short *top_line,
                           short delta) {
   short max_top = max_top_line_for_window(win, text);
@@ -911,15 +1127,26 @@ static void hslider_window(short win, const char *text, short *left_col,
 
 static void handle_toolbar_click(short mouse_x, short mouse_y) {
   short about_x, about_y, about_w, about_h;
+  short load_x, load_y, load_w, load_h;
+  short save_x, save_y, save_w, save_h;
   short run_x, run_y, run_w, run_h;
   short quit_x, quit_y, quit_w, quit_h;
 
-  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h, &run_x, &run_y,
-                     &run_w, &run_h, &quit_x, &quit_y, &quit_w, &quit_h);
+  get_toolbar_layout(&about_x, &about_y, &about_w, &about_h,
+                     &load_x, &load_y, &load_w, &load_h,
+                     &save_x, &save_y, &save_w, &save_h,
+                     &run_x, &run_y, &run_w, &run_h,
+                     &quit_x, &quit_y, &quit_w, &quit_h);
 
   if (mouse_x >= about_x && mouse_x < about_x + about_w && mouse_y >= about_y &&
       mouse_y < about_y + about_h) {
     do_about();
+  } else if (mouse_x >= load_x && mouse_x < load_x + load_w &&
+             mouse_y >= load_y && mouse_y < load_y + load_h) {
+    do_load();
+  } else if (mouse_x >= save_x && mouse_x < save_x + save_w &&
+             mouse_y >= save_y && mouse_y < save_y + save_h) {
+    do_save();
   } else if (mouse_x >= run_x && mouse_x < run_x + run_w && mouse_y >= run_y &&
              mouse_y < run_y + run_h) {
     do_run();
