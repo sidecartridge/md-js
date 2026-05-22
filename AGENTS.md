@@ -65,8 +65,12 @@ rp/src/
 target/atarist/src/
   mdjs.h / mdjs.c       ST-side C library — include these in ST projects
   sidecart_stubs.S      GAS-syntax translation of send_sync / send_sync_write
-  demo_gem.c            Reference GEM application
   main.s                ROM cartridge header + boot stub (vasm devpac syntax)
+
+examples/mdjscode/
+  main.c                MD/JS Code — GEM editor/runner for MDJSCODE.PRG
+  textedit.c / .h       Scrollable text editor widget (reusable)
+  Makefile              Standalone build; run as: ST_WORKING_FOLDER=<repo-root> stcmd make -C examples/mdjscode
 ```
 
 ## JerryScript integration — known pitfalls
@@ -223,7 +227,7 @@ Confusing trap: there are two demos and they share neither source nor build path
 
 1. **Cartridge-embedded demo** ([target/atarist/src/main.s](target/atarist/src/main.s) — labels `mdjsdemo_cart_run` / `mdjsdemo_ram_entry`) — 68k assembly. Runs when the user double-clicks the cartridge `c:` drive icon. Self-contained: includes its own AES wrappers, random-number generation (XBIOS Supexec reading `$4BA` 200 Hz counter), and call payload builder. **This is what we used for protocol debugging.**
 
-2. **Standalone `MDJSCODE.PRG`** ([target/atarist/src/demo_gem.c](target/atarist/src/demo_gem.c) + [mdjs.c](target/atarist/src/mdjs.c) + [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S)) — C-based GEM program, copied to `dist/`. For users to drop in their AUTO folder or run from desktop. Distinct filename from the cartridge-embedded `MDJSDEMO.PRG` so the two don't get confused.
+2. **Standalone `MDJSCODE.PRG`** ([examples/mdjscode/main.c](examples/mdjscode/main.c) + [mdjs.c](target/atarist/src/mdjs.c) + [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S)) — C-based GEM program built from `examples/mdjscode/`. For users to drop in their AUTO folder or run from desktop. Distinct filename from the cartridge-embedded `MDJSDEMO.PRG` so the two don't get confused.
 
 **If you change protocol behavior, you must update BOTH.** The cartridge demo uses the inline assembly path; the standalone PRG uses the C `mdjs.c` + stubs path. They send the same commands but via different code.
 
@@ -279,7 +283,7 @@ to return immediately. Don't touch unless you have a clear replacement.
 | Symptom on ST                           | Where to look                                                                                              |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | Boot message wrong / missing            | [main.s](target/atarist/src/main.s) `start_rom_code`, polls `$FAF00A` for magic `$4A`                      |
-| Demo always says "worker not detected"  | `mdjs_ping()` timing out — for standalone PRG, check [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S) parameter offsets (32-bit int!) |
+| Demo always says "worker not detected"  | `mdjs_ping()` timing out — for standalone PRG, check [sidecart_stubs.S](target/atarist/src/sidecart_stubs.S) parameter offsets (32-bit int!); ensure `examples/mdjscode/` was built and `MDJSCODE.PRG` deployed |
 | `function 'X' not found` for valid name | Byte-swap issue on CALL path or `add` actually wasn't defined — check UART for `Core 1 diag` and `Core 1 msg` |
 | Garbled chars in result                 | `core1_flush_result` not pre-swapping; check `COPY_AND_CHANGE_ENDIANESS_BLOCK16` is called                 |
 | Bombs / crash on demo exit              | Stack-resident demo code returning to corrupt SR/USP — check `mdjsdemo_cart_run`                            |

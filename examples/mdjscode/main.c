@@ -5,12 +5,8 @@
  *
  * Layout:
  *   - Toolbar strip at the top of the work area with "About" and "Run"
- *   - Top fixed GEM window titled "Code"
+ *   - Top fixed GEM window titled "Code" (editable via TexEdit)
  *   - Bottom fixed GEM window titled "Result"
- *
- * The Code window is read-only in this version; the IDE always calls a
- * function named `main` on the uploaded code, with whatever args the user
- * enters in the Run dialog.
  */
 
 #include <gem.h>
@@ -19,9 +15,11 @@
 #include <string.h>
 
 #include "mdjs.h"
+#include "textedit.h"
 
 static short app_id;
 static short aes_handle;
+static VdiHdl virt_vdi = -1;
 static short sys_char_w, sys_char_h, sys_cell_w, sys_cell_h;
 static short desk_x, desk_y, desk_w, desk_h;
 static short toolbar_h;
@@ -30,17 +28,16 @@ static short toolbar_win = -1;
 static short code_win = -1;
 static short result_win = -1;
 static short quit_requested = 0;
-static short code_top_line = 0;
 static short result_top_line = 0;
-static short code_left_col = 0;
 static short result_left_col = 0;
 
-static char current_code[512] =
-    "function main(name) {\n"
-    "  return 'Hello, ' + (name || 'World') + '!';\n"
-    "}\n"
-    "\n"
-    "/* Working editor coming soon! */";
+/* TexEdit for the Code window — declared static because it's ~52 KB */
+static TexEdit code_te;
+
+static const char *const initial_code_lines[] = {
+    "function main(name) {", "  return 'Hello, ' + (name || 'World') + '!';",
+    "}", "", "/* Edit me! */"};
+#define INITIAL_CODE_LINE_COUNT 5
 
 static char current_result[256] = "";
 
@@ -339,6 +336,10 @@ static void open_windows(void) {
   short content_y;
   short content_h;
   short half_h;
+  short work_in[11];
+  short work_out[57];
+  short i;
+  short cell_w, cell_h;
 
   wind_get(0, WF_WORKXYWH, &desk_x, &desk_y, &desk_w, &desk_h);
 
@@ -375,7 +376,27 @@ static void open_windows(void) {
   wind_open(result_win, desk_x, (short)(content_y + half_h), desk_w,
             (short)(content_h - half_h));
 
-  update_window_sliders(code_win, current_code, code_top_line, code_left_col);
+  /* Open virtual VDI workstation and get accurate cell metrics */
+  for (i = 0; i < 10; i++) work_in[i] = 1;
+  work_in[10] = 2;
+  v_opnvwk(work_in, &virt_vdi, work_out);
+
+  cell_w = sys_cell_w;
+  cell_h = sys_cell_h;
+
+  /* Override cell_w for ST low-res pixel doubling.
+     atrib[7..12] = ptsout; atrib[9] = ptsout[2] = rendered char width. */
+  if (virt_vdi >= 0) {
+    short atrib[13];
+    vqt_attributes(virt_vdi, atrib);
+    if (atrib[9] > 0) cell_w = atrib[9];
+  }
+
+  /* Init textedit for Code window */
+  textedit_init(&code_te, code_win, virt_vdi, cell_w, cell_h);
+  textedit_set_text(&code_te, initial_code_lines, INITIAL_CODE_LINE_COUNT);
+  textedit_update_sliders(&code_te);
+
   update_window_sliders(result_win, current_result, result_top_line,
                         result_left_col);
 
@@ -565,39 +586,10 @@ static void redraw_toolbar_window(void) {
 }
 
 static void redraw_code_window(void) {
-  short clip_x, clip_y, clip_w, clip_h;
-  short work_x, work_y, work_w, work_h;
-  short clip[4];
-
   if (code_win < 0) {
     return;
   }
-
-  wind_update(BEG_UPDATE);
-  graf_mouse(M_OFF, NULL);
-
-  wind_get(code_win, WF_WORKXYWH, &work_x, &work_y, &work_w, &work_h);
-  wind_get(code_win, WF_FIRSTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
-  while (clip_w > 0 && clip_h > 0) {
-    clip[0] = clip_x;
-    clip[1] = clip_y;
-    clip[2] = (short)(clip_x + clip_w - 1);
-    clip[3] = (short)(clip_y + clip_h - 1);
-
-    vs_clip(aes_handle, 1, clip);
-    fill_clip_rect(clip_x, clip_y, clip_w, clip_h);
-    draw_multiline_text(current_code, (short)(work_x + 4), work_y,
-                        (short)(work_y + work_h - 4), code_top_line,
-                        code_left_col);
-    vs_clip(aes_handle, 0, clip);
-
-    wind_get(code_win, WF_NEXTXYWH, &clip_x, &clip_y, &clip_w, &clip_h);
-  }
-
-  graf_mouse(M_ON, NULL);
-  graf_mouse(ARROW, NULL);
-  wind_update(END_UPDATE);
-  update_window_sliders(code_win, current_code, code_top_line, code_left_col);
+  textedit_redraw_all(&code_te);
 }
 
 static void redraw_result_window(void) {
@@ -673,10 +665,31 @@ static short run_dialog(void) {
   return (short)(exit_obj == DL_OK);
 }
 
+/* Flatten the TexEdit buffer back into a single string for upload */
+static void build_upload_buf(char *buf, int buflen) {
+  short r, n;
+  char line[TE_MAX_LINE_LEN + 1];
+  int pos = 0;
+
+  n = textedit_get_line_count(&code_te);
+  for (r = 0; r < n; r++) {
+    short len = textedit_get_line(&code_te, r, line, (short)sizeof(line));
+    if (len < 0) len = 0;
+    if (pos + len + 1 >= buflen) break;
+    memcpy(buf + pos, line, len);
+    pos += len;
+    if (r < n - 1) {
+      buf[pos++] = '\n';
+    }
+  }
+  buf[pos] = '\0';
+}
+
 static void do_run(void) {
   short err;
   char args_input[ARGS_LEN + 4];
   char result[256];
+  static char upload_buf[TE_MAX_LINES * (TE_MAX_LINE_LEN + 1)];
 
   if (!run_dialog()) {
     return;
@@ -706,7 +719,9 @@ static void do_run(void) {
     return;
   }
 
-  err = (short)mdjs_upload(current_code);
+  build_upload_buf(upload_buf, (int)sizeof(upload_buf));
+
+  err = (short)mdjs_upload(upload_buf);
   if (err != 0) {
     set_result_error_with_fallback("Error: upload failed.");
     present_result_window();
@@ -731,8 +746,8 @@ static void do_about(void) {
   form_alert(1,
              "[1][MD/JS Code"
              "| "
-             "|If you'd like to embed MD/JS"
-             "|in your ST app, visit:"
+             "|Want to embed MD/JS in your"
+             "|own ST apps? Visit"
              "|github.com/neilrackett/md-js][OK]");
   wind_update(END_MCTRL);
   wind_update(END_UPDATE);
@@ -837,6 +852,44 @@ static void handle_toolbar_click(short mouse_x, short mouse_y) {
   }
 }
 
+static void handle_code_arrowed(short direction) {
+  short wx, wy, ww, wh;
+  short vis_rows, vis_cols;
+
+  wind_get(code_win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+  vis_rows = (code_te.cell_h > 0) ? wh / code_te.cell_h : 1;
+  vis_cols = (code_te.cell_w > 0) ? ww / code_te.cell_w : 1;
+
+  switch (direction) {
+    case WA_UPLINE:
+      code_te.vscroll--;
+      break;
+    case WA_DNLINE:
+      code_te.vscroll++;
+      break;
+    case WA_UPPAGE:
+      code_te.vscroll -= vis_rows;
+      break;
+    case WA_DNPAGE:
+      code_te.vscroll += vis_rows;
+      break;
+    case WA_LFLINE:
+      code_te.hscroll--;
+      break;
+    case WA_RTLINE:
+      code_te.hscroll++;
+      break;
+    case WA_LFPAGE:
+      code_te.hscroll -= vis_cols;
+      break;
+    case WA_RTPAGE:
+      code_te.hscroll += vis_cols;
+      break;
+  }
+  textedit_update_sliders(&code_te);
+  textedit_redraw_all(&code_te);
+}
+
 static void event_loop(void) {
   short ev;
   short msg[8];
@@ -849,8 +902,9 @@ static void event_loop(void) {
   graf_mkstate(&mx, &my, &last_mb, &ks);
 
   while (!quit_requested) {
-    ev = evnt_multi(MU_MESAG | MU_TIMER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    msg, 20L, &mx, &my, &mb, &ks, &key, &clicks);
+    ev = evnt_multi(MU_MESAG | MU_KEYBD | MU_TIMER, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, msg, (long)TE_BLINK_MS, &mx, &my, &mb, &ks,
+                    &key, &clicks);
 
     if (last_mb == 0 && mb != 0) {
       short wx, wy, ww, wh;
@@ -864,47 +918,54 @@ static void event_loop(void) {
     }
     last_mb = mb;
 
+    if (ev & MU_TIMER) {
+      textedit_blink(&code_te);
+    }
+
+    if (ev & MU_KEYBD) {
+      TEDirty batch;
+      short peek_ev;
+      short peek_msg[8];
+      short peek_mx, peek_my, peek_mb, peek_ks, peek_key, peek_clicks;
+
+      code_te.cursor_visible = 1;
+      batch = textedit_apply_key(&code_te, key);
+
+      /* Drain queued keystrokes to reduce flicker */
+      do {
+        peek_ev = evnt_multi(MU_KEYBD | MU_TIMER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, peek_msg, 0L, &peek_mx, &peek_my,
+                             &peek_mb, &peek_ks, &peek_key, &peek_clicks);
+        if (peek_ev & MU_KEYBD) {
+          TEDirty d = textedit_apply_key(&code_te, peek_key);
+          TE_DIRTY_UNION(batch, d);
+        }
+      } while (peek_ev & MU_KEYBD);
+
+      textedit_finish_edit(&code_te, batch);
+    }
+
     if (!(ev & MU_MESAG)) {
       continue;
     }
 
     switch (msg[0]) {
       case WM_REDRAW:
-        do_redraw(msg[3]);
+        if (msg[3] == code_win) {
+          short area[4];
+          area[0] = msg[4];
+          area[1] = msg[5];
+          area[2] = msg[6];
+          area[3] = msg[7];
+          textedit_redraw(&code_te, area);
+        } else {
+          do_redraw(msg[3]);
+        }
         break;
 
       case WM_ARROWED:
         if (msg[3] == code_win) {
-          switch (msg[4]) {
-            case WA_UPLINE:
-              scroll_window(code_win, current_code, &code_top_line, -1);
-              break;
-            case WA_DNLINE:
-              scroll_window(code_win, current_code, &code_top_line, 1);
-              break;
-            case WA_UPPAGE:
-              scroll_window(code_win, current_code, &code_top_line,
-                            -visible_lines_for_window(code_win));
-              break;
-            case WA_DNPAGE:
-              scroll_window(code_win, current_code, &code_top_line,
-                            visible_lines_for_window(code_win));
-              break;
-            case WA_LFLINE:
-              hscroll_window(code_win, current_code, &code_left_col, -1);
-              break;
-            case WA_RTLINE:
-              hscroll_window(code_win, current_code, &code_left_col, 1);
-              break;
-            case WA_LFPAGE:
-              hscroll_window(code_win, current_code, &code_left_col,
-                             -visible_columns_for_window(code_win));
-              break;
-            case WA_RTPAGE:
-              hscroll_window(code_win, current_code, &code_left_col,
-                             visible_columns_for_window(code_win));
-              break;
-          }
+          handle_code_arrowed(msg[4]);
         } else if (msg[3] == result_win) {
           switch (msg[4]) {
             case WA_UPLINE:
@@ -941,7 +1002,15 @@ static void event_loop(void) {
 
       case WM_VSLID:
         if (msg[3] == code_win) {
-          slider_window(code_win, current_code, &code_top_line, msg[4]);
+          short wx, wy, ww, wh;
+          short vmax;
+          wind_get(code_win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+          vmax = code_te.num_lines -
+                 ((code_te.cell_h > 0) ? wh / code_te.cell_h : 1);
+          if (vmax < 0) vmax = 0;
+          code_te.vscroll = (short)((long)msg[4] * vmax / 1000L);
+          textedit_update_sliders(&code_te);
+          textedit_redraw_all(&code_te);
         } else if (msg[3] == result_win) {
           slider_window(result_win, current_result, &result_top_line, msg[4]);
         }
@@ -949,9 +1018,31 @@ static void event_loop(void) {
 
       case WM_HSLID:
         if (msg[3] == code_win) {
-          hslider_window(code_win, current_code, &code_left_col, msg[4]);
+          short wx, wy, ww, wh;
+          short hmax;
+          short max_w = 0;
+          short i;
+          wind_get(code_win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
+          for (i = 0; i < code_te.num_lines; i++)
+            if (code_te.line_len[i] > max_w) max_w = code_te.line_len[i];
+          hmax = max_w + 1 - ((code_te.cell_w > 0) ? ww / code_te.cell_w : 1);
+          if (hmax < 0) hmax = 0;
+          code_te.hscroll = (short)((long)msg[4] * hmax / 1000L);
+          textedit_update_sliders(&code_te);
+          textedit_redraw_all(&code_te);
         } else if (msg[3] == result_win) {
           hslider_window(result_win, current_result, &result_left_col, msg[4]);
+        }
+        break;
+
+      case WM_SIZED:
+      case WM_MOVED:
+        wind_set(msg[3], WF_CURRXYWH, msg[4], msg[5], msg[6], msg[7]);
+        if (msg[3] == code_win) {
+          textedit_update_sliders(&code_te);
+          textedit_redraw_all(&code_te);
+        } else {
+          do_redraw(msg[3]);
         }
         break;
 
@@ -1013,6 +1104,10 @@ int main(void) {
   if (result_win >= 0) {
     wind_close(result_win);
     wind_delete(result_win);
+  }
+
+  if (virt_vdi >= 0) {
+    v_clsvwk(virt_vdi);
   }
 
   appl_exit();

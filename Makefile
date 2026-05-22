@@ -18,6 +18,11 @@ debug:
 	@echo "Using APP_UUID_KEY: $(APP_UUID_KEY_RESOLVED)"
 	./build.sh pico_w debug "$(APP_UUID_KEY_RESOLVED)"
 
+## Build ST-side example applications
+.PHONY: examples
+examples:
+	ST_WORKING_FOLDER=$(CURDIR) stcmd make -C examples/mdjscode
+
 ## Tag this version
 .PHONY: tag
 tag:
