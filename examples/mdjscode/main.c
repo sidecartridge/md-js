@@ -45,21 +45,35 @@ static char about_button_label[] = "About";
 static char run_button_label[] = "Run";
 static char quit_button_label[] = "Quit";
 
+#define FUNC_LEN 32
 #define ARGS_LEN 32
+static char dialog_func[FUNC_LEN + 1];
+static char dialog_func_template[FUNC_LEN + 1];
+static char dialog_func_valid[FUNC_LEN + 1];
 static char dialog_args[ARGS_LEN + 1];
-static char dialog_template[ARGS_LEN + 1];
-static char dialog_valid[ARGS_LEN + 1];
+static char dialog_args_template[ARGS_LEN + 1];
+static char dialog_args_valid[ARGS_LEN + 1];
 
-enum { DL_ROOT = 0, DL_LABEL, DL_INPUT, DL_OK, DL_CANCEL };
+enum {
+  DL_ROOT = 0,
+  DL_FUNC_LABEL,
+  DL_FUNC_INPUT,
+  DL_ARGS_LABEL,
+  DL_ARGS_INPUT,
+  DL_OK,
+  DL_CANCEL
+};
 
-#define DL_COUNT 5
+#define DL_COUNT 7
 
-static char d_label[] = "Parameters in JSON format:";
+static char d_func_label[] = "Function name";
+static char d_args_label[] = "Parameters (JSON)";
 static char d_ok[] = "OK";
 static char d_cancel[] = "Cancel";
 
 static OBJECT dialog_tree[DL_COUNT];
-static TEDINFO dialog_ted;
+static TEDINFO dialog_func_ted;
+static TEDINFO dialog_args_ted;
 
 static short line_height(void) {
   short h = (short)(sys_char_h + 2);
@@ -234,43 +248,69 @@ static void obfix_tree(OBJECT *tree, short count) {
 }
 
 static void build_dialog(void) {
-  short label_w = (short)strlen(d_label);
-  short dlg_w = (short)(label_w + 4);
-  short dlg_h = 7;
+  short args_label_w = (short)strlen(d_args_label);
   short input_w = ARGS_LEN;
   short btn_w = 8;
+  short dlg_w = (short)(input_w + 4);
   short i;
 
+  if (args_label_w + 4 > dlg_w) dlg_w = (short)(args_label_w + 4);
+
+  for (i = 0; i < FUNC_LEN; i++) {
+    dialog_func_template[i] = '_';
+    dialog_func_valid[i] = 'X';
+  }
+  dialog_func_template[FUNC_LEN] = '\0';
+  dialog_func_valid[FUNC_LEN] = '\0';
+  strcpy(dialog_func, "main");
+  for (i = (short)strlen(dialog_func); i < FUNC_LEN; i++) dialog_func[i] = '\0';
+
   for (i = 0; i < ARGS_LEN; i++) {
-    dialog_template[i] = '_';
-    dialog_valid[i] = 'X';
+    dialog_args_template[i] = '_';
+    dialog_args_valid[i] = 'X';
   }
-  dialog_template[ARGS_LEN] = '\0';
-  dialog_valid[ARGS_LEN] = '\0';
-
+  dialog_args_template[ARGS_LEN] = '\0';
+  dialog_args_valid[ARGS_LEN] = '\0';
   strcpy(dialog_args, "[]");
-  for (i = (short)strlen(dialog_args); i < ARGS_LEN; i++) {
-    dialog_args[i] = '\0';
-  }
+  for (i = (short)strlen(dialog_args); i < ARGS_LEN; i++) dialog_args[i] = '\0';
 
-  if (input_w + 4 > dlg_w) {
-    dlg_w = (short)(input_w + 4);
-  }
+  dialog_func_ted.te_ptext = dialog_func;
+  dialog_func_ted.te_ptmplt = dialog_func_template;
+  dialog_func_ted.te_pvalid = dialog_func_valid;
+  dialog_func_ted.te_font = 3;
+  dialog_func_ted.te_fontid = 0;
+  dialog_func_ted.te_just = 0;
+  dialog_func_ted.te_color = 0x1180;
+  dialog_func_ted.te_fontsize = 0;
+  dialog_func_ted.te_thickness = -1;
+  dialog_func_ted.te_txtlen = FUNC_LEN + 1;
+  dialog_func_ted.te_tmplen = FUNC_LEN + 1;
 
-  dialog_ted.te_ptext = dialog_args;
-  dialog_ted.te_ptmplt = dialog_template;
-  dialog_ted.te_pvalid = dialog_valid;
-  dialog_ted.te_font = 3;
-  dialog_ted.te_fontid = 0;
-  dialog_ted.te_just = 0;
-  dialog_ted.te_color = 0x1180;
-  dialog_ted.te_fontsize = 0;
-  dialog_ted.te_thickness = -1;
-  dialog_ted.te_txtlen = ARGS_LEN + 1;
-  dialog_ted.te_tmplen = ARGS_LEN + 1;
+  dialog_args_ted.te_ptext = dialog_args;
+  dialog_args_ted.te_ptmplt = dialog_args_template;
+  dialog_args_ted.te_pvalid = dialog_args_valid;
+  dialog_args_ted.te_font = 3;
+  dialog_args_ted.te_fontid = 0;
+  dialog_args_ted.te_just = 0;
+  dialog_args_ted.te_color = 0x1180;
+  dialog_args_ted.te_fontsize = 0;
+  dialog_args_ted.te_thickness = -1;
+  dialog_args_ted.te_txtlen = ARGS_LEN + 1;
+  dialog_args_ted.te_tmplen = ARGS_LEN + 1;
+
+  /* Layout (character rows):
+     0  top margin
+     1  "Function:" label
+     2  function input
+     3  (blank line)
+     4  "Parameters (JSON):" label
+     5  args input
+     6  top margin before buttons
+     7  buttons
+     8  bottom margin              => total height 9 */
 
   dialog_tree[DL_ROOT].ob_next = -1;
-  dialog_tree[DL_ROOT].ob_head = DL_LABEL;
+  dialog_tree[DL_ROOT].ob_head = DL_FUNC_LABEL;
   dialog_tree[DL_ROOT].ob_tail = DL_CANCEL;
   dialog_tree[DL_ROOT].ob_type = G_BOX;
   dialog_tree[DL_ROOT].ob_flags = OF_NONE;
@@ -279,31 +319,55 @@ static void build_dialog(void) {
   dialog_tree[DL_ROOT].ob_x = 0;
   dialog_tree[DL_ROOT].ob_y = 0;
   dialog_tree[DL_ROOT].ob_width = dlg_w;
-  dialog_tree[DL_ROOT].ob_height = dlg_h;
+  dialog_tree[DL_ROOT].ob_height = 9;
 
-  dialog_tree[DL_LABEL].ob_next = DL_INPUT;
-  dialog_tree[DL_LABEL].ob_head = -1;
-  dialog_tree[DL_LABEL].ob_tail = -1;
-  dialog_tree[DL_LABEL].ob_type = G_STRING;
-  dialog_tree[DL_LABEL].ob_flags = OF_NONE;
-  dialog_tree[DL_LABEL].ob_state = OS_NORMAL;
-  dialog_tree[DL_LABEL].ob_spec.free_string = d_label;
-  dialog_tree[DL_LABEL].ob_x = 2;
-  dialog_tree[DL_LABEL].ob_y = 1;
-  dialog_tree[DL_LABEL].ob_width = label_w;
-  dialog_tree[DL_LABEL].ob_height = 1;
+  dialog_tree[DL_FUNC_LABEL].ob_next = DL_FUNC_INPUT;
+  dialog_tree[DL_FUNC_LABEL].ob_head = -1;
+  dialog_tree[DL_FUNC_LABEL].ob_tail = -1;
+  dialog_tree[DL_FUNC_LABEL].ob_type = G_STRING;
+  dialog_tree[DL_FUNC_LABEL].ob_flags = OF_NONE;
+  dialog_tree[DL_FUNC_LABEL].ob_state = OS_NORMAL;
+  dialog_tree[DL_FUNC_LABEL].ob_spec.free_string = d_func_label;
+  dialog_tree[DL_FUNC_LABEL].ob_x = 2;
+  dialog_tree[DL_FUNC_LABEL].ob_y = 1;
+  dialog_tree[DL_FUNC_LABEL].ob_width = (short)strlen(d_func_label);
+  dialog_tree[DL_FUNC_LABEL].ob_height = 1;
 
-  dialog_tree[DL_INPUT].ob_next = DL_OK;
-  dialog_tree[DL_INPUT].ob_head = -1;
-  dialog_tree[DL_INPUT].ob_tail = -1;
-  dialog_tree[DL_INPUT].ob_type = G_FTEXT;
-  dialog_tree[DL_INPUT].ob_flags = OF_EDITABLE;
-  dialog_tree[DL_INPUT].ob_state = OS_NORMAL;
-  dialog_tree[DL_INPUT].ob_spec.tedinfo = &dialog_ted;
-  dialog_tree[DL_INPUT].ob_x = 2;
-  dialog_tree[DL_INPUT].ob_y = 3;
-  dialog_tree[DL_INPUT].ob_width = input_w;
-  dialog_tree[DL_INPUT].ob_height = 1;
+  dialog_tree[DL_FUNC_INPUT].ob_next = DL_ARGS_LABEL;
+  dialog_tree[DL_FUNC_INPUT].ob_head = -1;
+  dialog_tree[DL_FUNC_INPUT].ob_tail = -1;
+  dialog_tree[DL_FUNC_INPUT].ob_type = G_FTEXT;
+  dialog_tree[DL_FUNC_INPUT].ob_flags = OF_EDITABLE;
+  dialog_tree[DL_FUNC_INPUT].ob_state = OS_NORMAL;
+  dialog_tree[DL_FUNC_INPUT].ob_spec.tedinfo = &dialog_func_ted;
+  dialog_tree[DL_FUNC_INPUT].ob_x = 2;
+  dialog_tree[DL_FUNC_INPUT].ob_y = 2;
+  dialog_tree[DL_FUNC_INPUT].ob_width = FUNC_LEN;
+  dialog_tree[DL_FUNC_INPUT].ob_height = 1;
+
+  dialog_tree[DL_ARGS_LABEL].ob_next = DL_ARGS_INPUT;
+  dialog_tree[DL_ARGS_LABEL].ob_head = -1;
+  dialog_tree[DL_ARGS_LABEL].ob_tail = -1;
+  dialog_tree[DL_ARGS_LABEL].ob_type = G_STRING;
+  dialog_tree[DL_ARGS_LABEL].ob_flags = OF_NONE;
+  dialog_tree[DL_ARGS_LABEL].ob_state = OS_NORMAL;
+  dialog_tree[DL_ARGS_LABEL].ob_spec.free_string = d_args_label;
+  dialog_tree[DL_ARGS_LABEL].ob_x = 2;
+  dialog_tree[DL_ARGS_LABEL].ob_y = 4;
+  dialog_tree[DL_ARGS_LABEL].ob_width = args_label_w;
+  dialog_tree[DL_ARGS_LABEL].ob_height = 1;
+
+  dialog_tree[DL_ARGS_INPUT].ob_next = DL_OK;
+  dialog_tree[DL_ARGS_INPUT].ob_head = -1;
+  dialog_tree[DL_ARGS_INPUT].ob_tail = -1;
+  dialog_tree[DL_ARGS_INPUT].ob_type = G_FTEXT;
+  dialog_tree[DL_ARGS_INPUT].ob_flags = OF_EDITABLE;
+  dialog_tree[DL_ARGS_INPUT].ob_state = OS_NORMAL;
+  dialog_tree[DL_ARGS_INPUT].ob_spec.tedinfo = &dialog_args_ted;
+  dialog_tree[DL_ARGS_INPUT].ob_x = 2;
+  dialog_tree[DL_ARGS_INPUT].ob_y = 5;
+  dialog_tree[DL_ARGS_INPUT].ob_width = input_w;
+  dialog_tree[DL_ARGS_INPUT].ob_height = 1;
 
   dialog_tree[DL_OK].ob_next = DL_CANCEL;
   dialog_tree[DL_OK].ob_head = -1;
@@ -313,7 +377,7 @@ static void build_dialog(void) {
   dialog_tree[DL_OK].ob_state = OS_NORMAL;
   dialog_tree[DL_OK].ob_spec.free_string = d_ok;
   dialog_tree[DL_OK].ob_x = 2;
-  dialog_tree[DL_OK].ob_y = 5;
+  dialog_tree[DL_OK].ob_y = 7;
   dialog_tree[DL_OK].ob_width = btn_w;
   dialog_tree[DL_OK].ob_height = 1;
 
@@ -325,7 +389,7 @@ static void build_dialog(void) {
   dialog_tree[DL_CANCEL].ob_state = OS_NORMAL;
   dialog_tree[DL_CANCEL].ob_spec.free_string = d_cancel;
   dialog_tree[DL_CANCEL].ob_x = (short)(dlg_w - btn_w - 2);
-  dialog_tree[DL_CANCEL].ob_y = 5;
+  dialog_tree[DL_CANCEL].ob_y = 7;
   dialog_tree[DL_CANCEL].ob_width = btn_w;
   dialog_tree[DL_CANCEL].ob_height = 1;
 
@@ -542,7 +606,7 @@ static void draw_multiline_text(const char *text, short left, short top,
       p = eol + 1;
     }
   } else {
-    v_gtext(aes_handle, left, line_y, "(empty)");
+    v_gtext(aes_handle, left, line_y, "Click Run to execute the code");
   }
 }
 
@@ -652,7 +716,7 @@ static short run_dialog(void) {
   form_dial(FMD_GROW, 0, 0, 0, 0, x, y, w, h);
 
   objc_draw(dialog_tree, ROOT, MAX_DEPTH, x, y, w, h);
-  exit_obj = (short)(form_do(dialog_tree, DL_INPUT) & 0x7FFF);
+  exit_obj = (short)(form_do(dialog_tree, DL_FUNC_INPUT) & 0x7FFF);
   dialog_tree[exit_obj].ob_state &= ~OS_SELECTED;
 
   form_dial(FMD_SHRINK, x, y, w, h, 0, 0, 0, 0);
@@ -729,7 +793,20 @@ static void do_run(void) {
   }
 
   memset(result, 0, sizeof(result));
-  err = (short)mdjs_call("main", args_input, result, (int)sizeof(result));
+  {
+    short i, end;
+    end = (short)strlen(dialog_func);
+    for (i = (short)(end - 1); i >= 0; i--) {
+      if (dialog_func[i] == ' ' || dialog_func[i] == '_') {
+        dialog_func[i] = '\0';
+      } else {
+        break;
+      }
+    }
+    if (dialog_func[0] == '\0') strcpy(dialog_func, "main");
+  }
+
+  err = (short)mdjs_call(dialog_func, args_input, result, (int)sizeof(result));
   if (err != 0) {
     set_result_error_with_fallback("Error: call failed.");
     present_result_window();
