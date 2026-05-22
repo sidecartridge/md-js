@@ -414,9 +414,9 @@ static void open_windows(void) {
 
   wind_get(0, WF_WORKXYWH, &desk_x, &desk_y, &desk_w, &desk_h);
 
-  toolbar_h = (short)(sys_cell_h + 10);
-  if (toolbar_h < 18) {
-    toolbar_h = 18;
+  toolbar_h = (short)(sys_cell_h + 14);
+  if (toolbar_h < 22) {
+    toolbar_h = 22;
   }
 
   toolbar_win = wind_create(0, desk_x, desk_y, desk_w, toolbar_h);
@@ -488,9 +488,9 @@ static void get_toolbar_layout(short *about_x, short *about_y, short *about_w,
 
   wind_get(toolbar_win, WF_WORKXYWH, &wx, &wy, &ww, &wh);
 
-  btn_h = (short)(sys_char_h + 4);
-  if (btn_h < 12) {
-    btn_h = 12;
+  btn_h = (short)(sys_char_h + 8);
+  if (btn_h < 14) {
+    btn_h = 14;
   }
   btn_y = (short)(wy + ((wh - btn_h) / 2));
 
@@ -568,7 +568,7 @@ static void draw_button(short x, short y, short w, short h, const char *label) {
   v_pline(aes_handle, 5, outline);
 
   text_x = (short)(x + ((w - ((short)strlen(label) * sys_char_w)) / 2));
-  text_y = (short)(y + ((h - sys_char_h) / 2) + sys_char_h - 1);
+  text_y = (short)(y + (h + sys_char_h * 3 / 4) / 2);
   vst_effects(aes_handle, 0);
   vst_color(aes_handle, 1);
   v_gtext(aes_handle, text_x, text_y, (char *)label);
