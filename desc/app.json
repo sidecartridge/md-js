@@ -1,7 +1,7 @@
 {
   "uuid": "<APP_UUID>",
   "name": "MD/JS: JavaScript Worker",
-  "description": "MD/JS: JavaScript Worker for Atari ST. Upload and execute JavaScript on the Sidecartridge Multi-device, call named functions and receive results from your ST applications.",
+  "description": "MD/JS: JavaScript Worker for Atari ST enables you to upload and execute JavaScript on the Sidecartridge Multi-device, call named functions and receive results in your ST applications. For more information and examples, visit <a href=\"https://github.com/neilrackett/md-js\">https://github.com/neilrackett/md-js</a>.",
   "image": "https://atarist.neilrackett.com/<APP_UUID>.png",
   "tags": [
     "JavaScript",

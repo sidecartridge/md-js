@@ -12,10 +12,11 @@ MD/JS turns your SidecarT into a persistent JavaScript Worker for the Atari ST, 
 - Load text or JSON files using `fetch()`
 - Read JSON results
 
-Although the following limits apply:
+Within these limits:
 
 - 32KB JavaScript heap (48KB if compiled without fetch)
 - 2KB result buffer
+- fetch() using GET over HTTP only
 
 To see MD/JS in action, simply install the microfirmware, open the cartridge icon on your ST's desktop (lower case `c` drive) and run `MDJSDEMO.PRG`.
 
