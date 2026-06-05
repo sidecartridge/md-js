@@ -44,6 +44,7 @@ jobs:
     - name: Run - Build PICO_W release version
       env:
         APP_UUID: ${{ secrets.APP_UUID }}
+        SKIP_VERSION_BUMP: 1
       run: ./build.sh pico_w Release ${APP_UUID:-44444444-4444-4444-8444-444444444444}
 
     - name: Get current date
